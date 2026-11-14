@@ -227,6 +227,12 @@ async def whatsapp_webhook(request: Request):
 
     app_secret = Config.WHATSAPP_APP_SECRET
 
+    logger.info(
+    "[SECRET CHECK] length=%s whitespace=%s",
+    len(app_secret or ""),
+    bool(app_secret and app_secret != app_secret.strip()),
+    )
+
     # --------------------------------------------------------
     # 2. DIAGNOSTICA SICURA
     # --------------------------------------------------------
