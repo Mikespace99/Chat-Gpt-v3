@@ -14,6 +14,7 @@ from app.integrations.whatsapp import send_whatsapp_buttons, send_whatsapp_list,
 from app.orchestrator import OutgoingMessage, handle_message
 from app.repositories.customer import get_or_create_customer, normalize_phone
 from app.repositories.tenant import get_tenant_by_whatsapp_number, get_tenant_knowledge
+from app.controller.menu_selection import interpret_menu_selection, mark_menu_presented
 
 _KNOWLEDGE_TEXT_KEYS = ("services_text", "locations_text", "working_hours_text")
 
@@ -134,7 +135,8 @@ async def handle_whatsapp_message(
         # ============================================================
         # Conversazione scaduta per timeout
         # ============================================================
-        if expired:
+        if expired and not interpret_menu_selection(button_reply_id):
+            mark_menu_presented(context, combined_text)
             outgoing = OutgoingMessage(
                 texts=[
                     "La richiesta precedente è scaduta perché è passato troppo tempo.\n\n"
@@ -157,8 +159,9 @@ async def handle_whatsapp_message(
         # ============================================================
         # Primo messaggio di una nuova conversazione
         # ============================================================
+        menu_signal = interpret_menu_selection(button_reply_id)
         if is_new:
-            precomputed_ai1 = run_ai1_interpreter(
+            precomputed_ai1 = menu_signal or run_ai1_interpreter(
                 combined_text, build_ai1_input(context), tenant.get("timezone")
             )
             presentation = _build_presentation_text(tenant, knowledge)
@@ -178,7 +181,9 @@ async def handle_whatsapp_message(
                     phone_id,
                 )
             else:
-                # Presentazione + menu, stop
+                # Presentazione + menu, stop. The displayed menu is a REAL
+                # conversation transition, not a perpetually NEW context.
+                mark_menu_presented(context, combined_text)
                 outgoing = OutgoingMessage(
                     texts=[presentation + "\n\nCosa desidera fare?"],
                     buttons=_MENU_BUTTONS,
@@ -252,21 +257,25 @@ def prepare_whatsapp_message(
     context, conv_row, expired = context_repository.get_or_create_context(
         tenant["id"], customer, phone
     )
-    if expired:
+    if expired and not interpret_menu_selection(button_reply_id):
+        mark_menu_presented(context, message_text)
         outgoing = OutgoingMessage(
             texts=["La richiesta precedente è scaduta. Come posso aiutarla?"],
             buttons=_MENU_BUTTONS,
         )
     else:
         knowledge = get_tenant_knowledge(tenant["id"]) or {}
-        precomputed = None
+        # A real WhatsApp menu ID is authoritative for choosing the FLOW,
+        # never for granting confirmations or authorizing database writes.
+        precomputed = interpret_menu_selection(button_reply_id)
         first = context.conversation.status == ConversationStatus.NEW
         if first:
-            precomputed = run_ai1_interpreter(
+            precomputed = precomputed or run_ai1_interpreter(
                 message_text, build_ai1_input(context), tenant.get("timezone")
             )
             if (precomputed.intent not in _CLEAR_INTENTS
                     or precomputed.needs_clarification):
+                mark_menu_presented(context, message_text)
                 outgoing = OutgoingMessage(
                     texts=[_build_presentation_text(tenant, knowledge) + "\n\nCosa desidera fare?"],
                     buttons=_MENU_BUTTONS,
