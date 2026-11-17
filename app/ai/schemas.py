@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from typing import Literal
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.context.models import Intent
 
@@ -53,9 +53,17 @@ class InterpretedRequest(BaseModel):
 
 class AIEnvelope(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    requests: list[InterpretedRequest] = Field(min_length=1, max_length=4)
+    # Atto sociale indipendente dalle richieste operative: nessun permesso implicito.
+    dialogue_act: Literal["NONE", "GREETING", "THANKS", "CLOSING", "ACKNOWLEDGMENT"] = "NONE"
+    requests: list[InterpretedRequest] = Field(default_factory=list, max_length=4)
     needs_clarification: bool = False
     clarification_reason: str | None = Field(default=None, max_length=300)
+
+    @model_validator(mode="after")
+    def require_request_or_social_act(self):
+        if not self.requests and self.dialogue_act == "NONE":
+            raise ValueError("Richiesta vuota senza atto conversazionale")
+        return self
 
     @field_validator("clarification_reason")
     @classmethod
