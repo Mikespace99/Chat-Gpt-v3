@@ -20,10 +20,22 @@ def to_legacy_signal(envelope: AIEnvelope, ai_context: dict) -> AI1Result:
         return AI1Result(intent=Intent.UNKNOWN, entities={}, confidence=0.0,
                          needs_clarification=True, clarification_reason=reason)
 
+    requests = envelope.requests
+
+    # I messaggi puramente sociali possono non contenere richieste.
+    # Mai trasformare un ringraziamento in una conferma, cancellazione o
+    # abbandono: le operazioni esplicite hanno sempre la precedenza.
+    social_intents = {Intent.THANKS, Intent.GREETING, Intent.UNKNOWN}
+    social_only = not requests or all(r.intent in social_intents for r in requests)
+    if social_only and envelope.dialogue_act in {"THANKS", "CLOSING", "ACKNOWLEDGMENT"}:
+        return AI1Result(intent=Intent.THANKS, entities={}, confidence=1.0)
+    if social_only and envelope.dialogue_act == "GREETING":
+        return AI1Result(intent=Intent.GREETING, entities={}, confidence=1.0)
+
     if envelope.needs_clarification:
         return clarification(envelope.clarification_reason or "richiesta_ambigua")
-
-    requests = envelope.requests
+    if not requests:
+        return clarification("messaggio_non_classificato")
     op_intents = {r.intent for r in requests if r.intent in _PRIMARY_OPERATIONS}
     if len(op_intents) > 1 or sum(r.intent in _PRIMARY_OPERATIONS for r in requests) > 1:
         return clarification("richieste_operative_in_conflitto")
