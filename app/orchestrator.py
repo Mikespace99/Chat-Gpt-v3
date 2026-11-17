@@ -114,7 +114,11 @@ def handle_message(
         response_type = ResponseType.ASK_CLARIFICATION
 
     # 5. Costruzione del messaggio, testo (o sequenza) + eventuali bottoni/lista.
-    if response_type == ResponseType.REQUEST_ABANDONED:
+    if response_type == ResponseType.GOODBYE:
+        # Cortesia finale: nessun accesso a database, nessun secondo modello,
+        # nessuna ripetizione della conferma della prenotazione.
+        outgoing = OutgoingMessage(texts=["La ringrazio, buona giornata!"])
+    elif response_type == ResponseType.REQUEST_ABANDONED:
         # Testo fisso e deterministico: non serve l'AI per dire
         # "va bene, ho annullato" - zero rischio, zero costo.
         outgoing = OutgoingMessage(
