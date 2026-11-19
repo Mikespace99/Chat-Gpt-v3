@@ -19,6 +19,7 @@ non solo insieme alla risposta finale (che può richiedere una ricerca).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import unicodedata
 
 from app.controller.confirmation import is_valid_confirmation, issue_confirmation
 from app.ai.context_summary import build_ai1_input
@@ -62,6 +63,41 @@ class OutgoingMessage:
     list_rows: list[dict] = field(default_factory=list)
 
 
+def _explicit_confirmation_reply(message_text: str, button_reply_id: str | None,
+                                 context: ConversationContext):
+    """Interpreta solo il protocollo Sì/No, MAI frasi libere o ringraziamenti.
+
+    Un pulsante con ID non valido viene comunque sottoposto al controllo
+    del controller; non trasformarlo in un assenso testuale.
+    """
+    from app.context.models import AI1Result
+
+    if not context.confirmation.required:
+        return None
+    if button_reply_id:
+        proposal = context.confirmation.proposal_id
+        if proposal and button_reply_id == f"confirm:{proposal}":
+            intent = Intent.CONFIRM
+        elif proposal and button_reply_id == f"reject:{proposal}":
+            intent = Intent.REJECT
+        else:
+            return None
+    else:
+        # Solo risposte autonome e inequivocabili. NON "ok, grazie",
+        # "sì ma...", o testi che potrebbero modificare la proposta.
+        normalized = unicodedata.normalize("NFKD", message_text.strip().lower())
+        normalized = "".join(c for c in normalized if not unicodedata.combining(c))
+        normalized = normalized.strip(" .!?")
+        if normalized == "si":
+            intent = Intent.CONFIRM
+        elif normalized == "no":
+            intent = Intent.REJECT
+        else:
+            return None
+    return AI1Result(intent=intent, entities={}, confidence=1.0,
+                     needs_clarification=False)
+
+
 def handle_message(
     context: ConversationContext,
     message_text: str,
@@ -74,10 +110,26 @@ def handle_message(
     # 1. AI#1: interpreta (solo il blocco minimo, non l'intero context).
     # Se il chiamante l'ha già classificato (es. per decidere se inviare
     # l'ack prima di iniziare), riusiamo quello - non lo richiediamo due volte.
-    if precomputed_ai1 is not None:
+    # Prima dell'LLM risolviamo risposte binarie riferite a una proposta
+    # reale. L'AI non puo' declassare "sì" a saluto e non puo' autorizzare
+    # nulla senza una conferma persistita e valida.
+    explicit_reply = _explicit_confirmation_reply(message_text, button_reply_id, context)
+    if explicit_reply is not None:
+        ai1 = explicit_reply
+    elif precomputed_ai1 is not None:
         ai1 = precomputed_ai1
     else:
         ai1 = run_ai1_interpreter(message_text, build_ai1_input(context), tenant.get("timezone"))
+
+    # Durante una conferma, un messaggio sociale non termina il workflow.
+    # In particolare non usare GOODBYE per un acknowledgement ambiguo.
+    if (context.confirmation.required and ai1.intent in (Intent.THANKS, Intent.GREETING)
+            and explicit_reply is None):
+        ai1 = ai1.model_copy(update={
+            "intent": Intent.UNKNOWN,
+            "needs_clarification": True,
+            "clarification_reason": "conferma_pendente_risposta_non_esplicita",
+        })
     print(f"[DIAGNOSTICA AI1] intent={ai1.intent} entities={ai1.entities} needs_clarification={ai1.needs_clarification} reason={ai1.clarification_reason}")
 
     # Convalida la proposta PRIMA che il Context Manager alteri lo stato.
@@ -88,8 +140,13 @@ def handle_message(
         ("confirm:" if ai1.intent == Intent.CONFIRM else "reject:")
         + (context.confirmation.proposal_id or "")
     )
-    invalid_button = bool(button_reply_id and button_is_confirmation
-                          and button_reply_id != expected_button)
+    # Anche se l'AI classifica erroneamente il testo del pulsante come
+    # ringraziamento, un ID di conferma/rifiuto scaduto NON deve diventare
+    # un saluto né poter confermare un'altra proposta.
+    proposal_button = bool(button_reply_id and
+                           button_reply_id.startswith(("confirm:", "reject:")))
+    invalid_button = bool(proposal_button and
+                          (not button_is_confirmation or button_reply_id != expected_button))
     if invalid_button or (ai1.intent == Intent.CONFIRM and not is_valid_confirmation(context)):
         ai1 = ai1.model_copy(update={
             "intent": Intent.UNKNOWN,
@@ -99,6 +156,14 @@ def handle_message(
 
     # 2. Context Manager: aggiorna lo stato
     context = apply_ai1_result(context, ai1, message_text)
+
+    # Un saluto durante una conferma pendente NON completa la procedura,
+    # ma nemmeno deve finire su AI#2 con un fallback imprevedibile.
+    if ai1.clarification_reason == "conferma_pendente_risposta_non_esplicita":
+        return context, OutgoingMessage(texts=[
+            "La ringrazio. La richiesta è ancora in attesa di conferma: "
+            "per procedere risponda Sì o No alla proposta precedente."
+        ])
 
     # 3. Router: decide ed esegue la business logic (skip per le chiacchiere)
     if ai1.needs_clarification:
