@@ -248,13 +248,28 @@
         this.locations = (cfg.locations || []).filter(l => l.active !== false);
         this.services = (cfg.services || []).filter(s => s.active !== false);
 
-        if (window.innerWidth < 768) this.viewName = 'timeGridDay';
+        // La Dashboard apre /agenda?date=YYYY-MM-DD: usa quel giorno
+        // come punto di partenza, senza dipendere dal fuso orario UTC.
+        const requestedDate = new URLSearchParams(window.location.search).get('date');
+        let initialDate = null;
+        if (requestedDate && /^\d{4}-\d{2}-\d{2}$/.test(requestedDate)) {
+          const [year, month, day] = requestedDate.split('-').map(Number);
+          const parsed = new Date(year, month - 1, day);
+          if (parsed.getFullYear() === year &&
+              parsed.getMonth() === month - 1 &&
+              parsed.getDate() === day) {
+            initialDate = requestedDate;
+          }
+        }
+
+        if (window.innerWidth < 768 || initialDate) this.viewName = 'timeGridDay';
 
         const calEl = document.getElementById('calendar');
         this.calendar = new FullCalendar.Calendar(calEl, {
           locale: 'it',
           height: 'auto',
           initialView: this.viewName,
+          ...(initialDate ? { initialDate } : {}),
           slotMinTime: '07:00:00',
           slotMaxTime: '21:00:00',
           nowIndicator: true,
