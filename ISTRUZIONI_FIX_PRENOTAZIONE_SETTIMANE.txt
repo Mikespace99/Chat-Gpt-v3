@@ -1,0 +1,49 @@
+CORREZIONE PRENOTAZIONE / SETTIMANA SUCCESSIVA
+============================================
+
+Versione di partenza: Chat-Gpt-v3-fix-conferme-e-posticipare.zip.
+
+Cambiamenti:
+- Prenotazione senza preferenze: cerca e propone il primo slot disponibile
+  (nell'orizzonte di ricerca configurato), non una panoramica arbitraria.
+- Ricerca su periodo esplicito: mantiene la panoramica reale dei giorni.
+- «La settimana successiva»: l'AI produce relative_week_shift; Python
+  risolve in base all'ultima settimana effettivamente offerta.
+- «Settimana del 30 novembre»: week_containing_date; Python calcola lun-dom.
+- Un nuovo intervallo pulisce le proposte di slot vecchie.
+- Le istruzioni dell'AI rimangono modificabili in interpreter.md.
+
+File applicativi modificati:
+  app/ai/schemas.py
+  app/ai/prompts/interpreter.md
+  app/ai/context_summary.py
+  app/context/models.py
+  app/context/context_manager.py
+  app/context/search_resolver.py
+  app/flows/booking.py
+  app/orchestrator.py
+
+File di test aggiunto:
+  tests/test_booking_relative_weeks_v3.py
+
+Verifiche locali:
+  python -m pytest -q -> 69 passed
+  python -m compileall -q app -> OK
+
+DEPLOY SU RENDER
+Sostituisci i file applicativi elencati su GitHub mantenendo la struttura.
+Non sono richieste modifiche di SQL o variabili Environment.
+Per minimizzare i rischi prova prima in una conversazione di test.
+
+SCENARI DI COLLAUDO CON META REALE
+1. «Vorrei prenotare» -> prima data/ora disponibile da Supabase.
+2. «No, la settimana successiva» -> settimana successiva a quella offerta.
+3. «Ancora quella dopo» -> incrementa un'altra settimana.
+4. «Preferisco la settimana del 30 novembre» -> ricerca 30/11-06/12 (2026).
+5. Accetta una proposta -> conferma esplicita e unica; controlla l'agenda.
+
+IMPORTANTE
+I test locali utilizzano dipendenze simulate. Il modello AI remoto,
+Supabase e Meta non sono stati collaudati end-to-end in questo ambiente.
+Per settimane oltre l'orizzonte del motore, il comportamento dipende
+alla configurazione del tenant e dal motore disponibilita' originale.
