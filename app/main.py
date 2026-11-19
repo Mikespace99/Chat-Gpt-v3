@@ -220,11 +220,7 @@ async def whatsapp_webhook(request: Request):
     # --------------------------------------------------------
 
     raw_body = await request.body()
-    logger.info(
-    "[META TRACE] body_sha256=%s",
-    hashlib.sha256(raw_body).hexdigest()[:16],
-    )
-
+    
     signature = request.headers.get(
         "x-hub-signature-256"
     )
