@@ -315,6 +315,36 @@ def apply_ai1_result(
             context.booking.slot_id = None
             return context
 
+    # «Solo orario» nel RESCHEDULE conserva il giorno dell'appuntamento
+    # verificato e cerca TUTTI gli orari possibili dello stesso giorno.
+    # L'AI comunica keep_same_date=true; il backend non inventa date.
+    # Non usiamo vecchi filtri residui da altre ricerche.
+    if (effective_intent == Intent.CHANGE_PREFERENCE
+            and ai1.entities.get("keep_same_date") is True
+            and context.operation.type == OperationType.RESCHEDULE
+            and not has_explicit_new_day):
+        target = next((a for a in context.appointments
+                       if a.id == context.operation.target_appointment_id), None)
+        if target is not None and not context.confirmation.required:
+            context.search.date_from = target.date
+            context.search.date_to = target.date
+            context.search.preferred_date = target.date
+            context.search.period = None
+            context.search.preferred_weekday = None
+            context.search.week_part = None
+            context.search.preferred_time = None
+            context.search.time_preference = ai1.entities.get("time_preference")
+            context.search.time_from = None
+            context.search.time_to = None
+            context.search.after_time = None
+            context.search.before_time = None
+            context.search.excluded_dates = []
+            context.search.excluded_slots = []
+            context.offered_slots = []
+            context.offered_days = []
+            context.booking.slot_id = None
+            return context
+
     if not matched_day and effective_intent in _SEARCH_RELEVANT_INTENTS and _has_search_signal(ai1.entities):
         # Per RESCHEDULE, "la settimana successiva"/"tra due settimane"
         # ecc. sono relative alla data dell'APPUNTAMENTO da spostare,
