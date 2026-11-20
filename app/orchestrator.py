@@ -36,6 +36,8 @@ from app.ai.interpreter import run_ai1_interpreter
 from app.ai.responder import compose_final_message, run_ai2_responder
 from app.ai.response_type_resolver import resolve_response_type
 from app.context.context_manager import apply_ai1_result
+from app.context.appointment_matcher import match_offered_appointment
+from app.context.models import AI1Result, ConversationStep, PendingAction
 from app.context.models import ConversationContext, Intent, Message, OperationType, ResponseType, SystemResult
 from app.flows.common import find_selected_offered_slot
 from app.controller.workflow import dispatch
@@ -114,7 +116,39 @@ def handle_message(
     # reale. L'AI non puo' declassare "sì" a saluto e non puo' autorizzare
     # nulla senza una conferma persistita e valida.
     explicit_reply = _explicit_confirmation_reply(message_text, button_reply_id, context)
-    if explicit_reply is not None:
+
+    # La scelta di un appuntamento mostrato da NOI e' un evento di
+    # protocollo, non un giudizio linguistico dell'AI. Gli ID dei bottoni
+    # vengono confrontati con gli appuntamenti del contesto autorizzato.
+    # Anche il titolo mostrato (GG/MM HH:MM) e' riconoscibile, ma soltanto
+    # durante l'effettiva attesa di questa selezione.
+    appointment_choice = None
+    if (context.conversation.current_step == ConversationStep.IDENTIFY_APPOINTMENT
+            and context.conversation.pending_action == PendingAction.SELECT_APPOINTMENT
+            and context.operation.type in (OperationType.RESCHEDULE, OperationType.CANCEL)
+            and len(context.appointments) > 1):
+        if button_reply_id and button_reply_id.startswith("appt_"):
+            selected_id = button_reply_id.removeprefix("appt_")
+            appointment_choice = next((a for a in context.appointments if a.id == selected_id), None)
+        elif not button_reply_id:
+            appointment_choice = match_offered_appointment({}, context.appointments, message_text)
+
+    if appointment_choice is not None:
+        # Il matcher del Context Manager potra' estrarre la stessa scelta
+        # dal testo visualizzato (o dal numero), senza dipendere da AI#1.
+        ai1 = AI1Result(intent=Intent.SELECT_APPOINTMENT, entities={},
+                        confidence=1.0, needs_clarification=False)
+        if button_reply_id and button_reply_id.startswith("appt_"):
+            # Non alteriamo testo/history: la scelta ID verificata e'
+            # registrata dal Context Manager sulla copia del contesto.
+            context = context.model_copy(deep=True)
+            context.selected_appointment_id = appointment_choice.id
+    elif button_reply_id and button_reply_id.startswith("appt_"):
+        # ID scaduto/sbagliato: mai trasformare un bottone in REJECT.
+        ai1 = AI1Result(intent=Intent.UNKNOWN, entities={}, confidence=0.0,
+                        needs_clarification=True,
+                        clarification_reason="appuntamento_non_selezionabile")
+    elif explicit_reply is not None:
         ai1 = explicit_reply
     elif precomputed_ai1 is not None:
         ai1 = precomputed_ai1
