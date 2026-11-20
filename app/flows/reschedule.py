@@ -30,6 +30,7 @@ from app.context.models import (
     ConversationStep,
     ContextValue,
     PendingAction,
+    SearchCriteria,
     SystemResult,
 )
 from app.flows.common import (
@@ -56,10 +57,9 @@ def identify_target(
     """
     context = context.model_copy(deep=True)
 
-    if context.conversation.current_step == ConversationStep.COMPLETED:
-        # Richiesta nuova dopo uno spostamento già concluso: si
-        # riparte puliti, senza target/criteri della volta precedente.
-        context = reset_for_new_operation(context)
+    # Un nuovo spostamento non eredita preferenze, slot o blacklist
+    # da precedenti prenotazioni/ricerche dello stesso cliente.
+    context = reset_for_new_operation(context)
 
     if not context.customer.id:
         return context, SystemResult(success=False, error_code="CUSTOMER_NOT_IDENTIFIED")
@@ -136,6 +136,10 @@ def appointment_selected(
         context.service = ContextValue(value=target.service, source="SYSTEM", confirmed=True)
 
     context.conversation.pending_action = PendingAction.NONE
+    context.search = SearchCriteria()
+    context.offered_slots = []
+    context.offered_days = []
+    context.booking.slot_id = None
     return search_or_ask_preference(context, tenant, knowledge)
 
 
