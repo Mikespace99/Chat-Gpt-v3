@@ -15,5 +15,8 @@
     "max_tool_calls_per_turn",
     "max_search_days",
     "max_recent_user_messages"
-  ]
+  ],
+  "confirmation_semantic_enabled": true,
+  "confirmation_timeout_seconds": 12,
+  "confirmation_max_output_tokens": 130
 }

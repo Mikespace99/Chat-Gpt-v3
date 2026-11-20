@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import unicodedata
+import re
 
 from app.controller.confirmation import is_valid_confirmation, issue_confirmation
 from app.ai.context_summary import build_ai1_input
@@ -85,11 +86,13 @@ def _explicit_confirmation_reply(message_text: str, button_reply_id: str | None,
         else:
             return None
     else:
-        # Solo risposte autonome e inequivocabili. NON "ok, grazie",
-        # "sì ma...", o testi che potrebbero modificare la proposta.
+        # Solo i due simboli binari canonici sono scorciatoie di protocollo.
+        # QUALSIASI frase naturale ("ok procediamo", "si va bene", ecc.)
+        # passa al classificatore semantico: nessuna lista da mantenere.
         normalized = unicodedata.normalize("NFKD", message_text.strip().lower())
         normalized = "".join(c for c in normalized if not unicodedata.combining(c))
-        normalized = normalized.strip(" .!?")
+        normalized = re.sub(r"[.,!?;:]+", " ", normalized)
+        normalized = " ".join(normalized.split())
         if normalized == "si":
             intent = Intent.CONFIRM
         elif normalized == "no":
@@ -167,7 +170,58 @@ def handle_message(
                         needs_clarification=True,
                         clarification_reason="appuntamento_non_selezionabile")
     elif explicit_reply is not None:
+        # Fast path per i pulsanti verificati e le risposte binarie tradizionali.
         ai1 = explicit_reply
+    elif context.confirmation.required and button_reply_id:
+        # Un button non corrispondente alla proposta corrente non puo'
+        # essere reinterpretato come un consenso attraverso testo o LLM.
+        context = apply_ai1_result(context, AI1Result(
+            intent=Intent.UNKNOWN, entities={}, confidence=0.0,
+            needs_clarification=True, clarification_reason="pulsante_non_valido",
+        ), message_text)
+        return context, OutgoingMessage(texts=[
+            "Il pulsante non corrisponde alla proposta attuale. "
+            "La richiesta è ancora in attesa di conferma: utilizzi i pulsanti dell'ultima proposta."
+        ])
+    elif context.confirmation.required and not button_reply_id:
+        # Il precompute del webhook non puo' decidere una conferma: il
+        # classificatore semantico riceve il contesto della proposta.
+        # Anche il routing downstream richiede il digest della proposta.
+        from app.agent.semantic_confirmation import (
+            ConfirmationDecision, interpret_confirmation,
+        )
+        if not is_valid_confirmation(context):
+            ai1 = AI1Result(intent=Intent.UNKNOWN, entities={}, confidence=0.0,
+                            needs_clarification=True,
+                            clarification_reason="conferma_assente_scaduta_o_modificata")
+        else:
+            decision = interpret_confirmation(context, message_text)
+            if decision.decision == ConfirmationDecision.ACCEPT and decision.unconditional:
+                ai1 = AI1Result(intent=Intent.CONFIRM, entities={}, confidence=1.0)
+            elif decision.decision == ConfirmationDecision.REJECT:
+                ai1 = AI1Result(intent=Intent.REJECT, entities={}, confidence=1.0)
+            else:
+                # MODIFY/UNCERTAIN/UNRELATED: never execute the pending
+                # proposal. Store the user message without changing it.
+                context = apply_ai1_result(
+                    context, AI1Result(intent=Intent.UNKNOWN, entities={},
+                                       confidence=0.0, needs_clarification=True,
+                                       clarification_reason="conferma_pendente_non_accettata"),
+                    message_text,
+                )
+                if decision.decision == ConfirmationDecision.MODIFY:
+                    return context, OutgoingMessage(texts=[
+                        "Ho capito che desidera modificare la proposta. "
+                        "Non ho eseguito alcuna operazione. "
+                        "Selezioni No per interrompere la conferma attuale e rivedere la richiesta."
+                    ], buttons=[(f"reject:{context.confirmation.proposal_id}", "No")])
+                return context, OutgoingMessage(texts=[
+                    "Non ho interpretato una conferma esplicita e senza modifiche. "
+                    "La richiesta è ancora in attesa di conferma: desidera confermare o rifiutare?"
+                ], buttons=[
+                    (f"confirm:{context.confirmation.proposal_id}", "Sì"),
+                    (f"reject:{context.confirmation.proposal_id}", "No"),
+                ])
     elif precomputed_ai1 is not None:
         ai1 = precomputed_ai1
     else:
@@ -208,6 +262,14 @@ def handle_message(
 
     # 2. Context Manager: aggiorna lo stato
     context = apply_ai1_result(context, ai1, message_text)
+
+    # Una proposta assente/scaduta/non corrispondente non deve passare da
+    # AI#2, ne' fornire un percorso alternativo verso la scrittura.
+    if ai1.clarification_reason == "conferma_assente_scaduta_o_modificata":
+        return context, OutgoingMessage(texts=[
+            "La richiesta è ancora in attesa di conferma, ma la proposta non è più valida. "
+            "Occorre richiedere una nuova proposta prima di procedere."
+        ])
 
     # Un saluto durante una conferma pendente NON completa la procedura,
     # ma nemmeno deve finire su AI#2 con un fallback imprevedibile.

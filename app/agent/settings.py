@@ -25,6 +25,9 @@ class AgentSettings(BaseModel):
     max_recent_user_messages: int = Field(6, ge=0, le=12)
     request_timeout_seconds: int = Field(18, ge=3, le=45)
     max_output_tokens: int = Field(450, ge=100, le=900)
+    confirmation_semantic_enabled: bool = True
+    confirmation_timeout_seconds: int = Field(12, ge=3, le=30)
+    confirmation_max_output_tokens: int = Field(130, ge=60, le=300)
     allow_tenant_overrides: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
