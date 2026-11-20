@@ -109,6 +109,24 @@ def handle_message(
     precomputed_ai1=None,
     button_reply_id: str | None = None,
 ) -> tuple[ConversationContext, OutgoingMessage]:
+    # v4: controlled, read-only tool agent for navigating availability.
+    # Button selections and all confirmations stay in the deterministic flow.
+    # The agent has no tool capable of writing to Supabase.
+    if button_reply_id is None and precomputed_ai1 is None:
+        from app.agent.runtime import is_navigation_phase, run_navigation_agent
+        if is_navigation_phase(context, button_reply_id):
+            try:
+                nav_result = run_navigation_agent(context, message_text, tenant, knowledge)
+            except Exception as exc:
+                # Fail over to the existing controller without granting the AI
+                # extra authority; errors are logged without customer content.
+                print(f"[agent.navigation] fallback: {type(exc).__name__}")
+                nav_result = None
+            if nav_result is not None:
+                return nav_result.context, OutgoingMessage(
+                    texts=[nav_result.text], buttons=nav_result.buttons
+                )
+
     # 1. AI#1: interpreta (solo il blocco minimo, non l'intero context).
     # Se il chiamante l'ha già classificato (es. per decidere se inviare
     # l'ack prima di iniziare), riusiamo quello - non lo richiediamo due volte.

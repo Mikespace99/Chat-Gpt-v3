@@ -63,6 +63,8 @@ def reset_for_new_operation(context: ConversationContext) -> ConversationContext
     """
     context = context.model_copy(deep=True)
     context.search = SearchCriteria()
+    from app.context.models import AgentNavigation
+    context.agent_navigation = AgentNavigation()
     context.service = ContextValue()
     context.offered_slots = []
     context.offered_days = []
