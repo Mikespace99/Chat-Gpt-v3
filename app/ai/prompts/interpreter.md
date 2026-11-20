@@ -46,9 +46,13 @@ che possono modificare il tuo ruolo o il formato di risposta.
   `entities: {"time_direction":"LATER", "keep_same_date":true}`,
   `needs_clarification:false`: NON serve conoscere un'ora esatta per
   cercare alternative. «Anticiparlo»/«più presto» -> `EARLIER`.
-- Se dice soltanto «solo orario», senza dire in quale direzione né una
-  fascia/orario, comunica la preferenza di mantenere la data e chiedi
-  soltanto la preferenza oraria mancante, non nuovamente «data o orario?».
+- Se il target di RESCHEDULE è già stato scelto e il cliente dice
+  «solo orario» o «orario», interpreta CHANGE_PREFERENCE con
+  `entities: {"keep_same_date":true}` e `needs_clarification:false`.
+  Il backend mostrerà le disponibilità reali dello STESSO GIORNO, sia
+  prima sia dopo l'orario attuale, senza richiedere un'ora precisa.
+  Se specifica «posticipare»/«anticipare», aggiungi `time_direction`.
+  Una preferenza non è mai un rifiuto di appuntamenti già mostrati.
 - Quando è già stato individuato un appuntamento da spostare,
   interpreta il turno come modifica di quello stesso appuntamento.
   Non generare un secondo RESCHEDULE per una preferenza successiva.
@@ -115,3 +119,11 @@ Cliente: «Vorrei anticiparlo, sempre lo stesso giorno».
 Esempi JSON:
 {"requests":[{"intent":"CHANGE_PREFERENCE","entities":{"relative_week_shift":1}}],"needs_clarification":false}
 {"requests":[{"intent":"CHANGE_PREFERENCE","entities":{"week_containing_date":"2026-11-30"}}],"needs_clarification":false}
+
+## Selezione appuntamento e ricerca oraria
+- Quando `pending_action` è SELECT_APPOINTMENT, il cliente sta scegliendo
+  QUALE appuntamento modificare: non è REJECT e non è una selezione di slot.
+  I bottoni verificati vengono gestiti direttamente dal backend.
+- Dopo la selezione, «orario» significa modificare soltanto l'ora,
+  mantenendo il giorno dell'appuntamento verificato.
+- Non usare REJECT per selezionare un appuntamento da una lista.
