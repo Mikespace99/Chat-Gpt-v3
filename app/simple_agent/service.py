@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from datetime import datetime, date as Date, timedelta
 from uuid import uuid4
 from zoneinfo import ZoneInfo
@@ -25,6 +26,9 @@ MAX_CALLS = 4
 MAX_HISTORY = 12  # six complete exchanges, if alternating
 # Optional WhatsApp buttons: disabled by default; text always works.
 SHOW_CONFIRM_BUTTONS = os.getenv("WHATSAPP_CONFIRM_BUTTONS", "false").lower() in ("1", "true", "yes", "on")
+# Le fasce vengono definite SOLO nel motore: nessun orario duplicato nel prompt.
+AFTERNOON_START = f"{engine.TIME_BANDS['afternoon'][0]:02d}:00"
+EVENING_START = f"{engine.TIME_BANDS['evening'][0]:02d}:00"
 
 
 class SearchArgs(BaseModel):
@@ -40,7 +44,7 @@ class SearchArgs(BaseModel):
 
     @model_validator(mode="after")
     def check(self):
-        if self.period not in (None, "this_week", "next_week", "following_last_search_week"):
+        if self.period not in (None, "this_week", "next_week", "following_last_search_week", "same_last_search"):
             raise ValueError("Periodo non valido")
         if self.week_part not in (None, "start", "middle", "end"):
             raise ValueError("Porzione della settimana non valida")
@@ -89,7 +93,7 @@ TOOLS = [
       "description":"Cerca orari REALI, dopo che il cliente ha indicato almeno una preferenza temporale. Per 'altri orari' escludi i già proposti.",
       "parameters":{"type":"object","properties":{
         "date_from":{"type":"string","description":"YYYY-MM-DD; usare SOLO per date esplicite"},"date_to":{"type":"string","description":"YYYY-MM-DD; usare SOLO per date esplicite"},
-        "period":{"type":"string","enum":["this_week","next_week","following_last_search_week"],"description":"this_week/next_week sono rispetto a OGGI; following_last_search_week è la settimana DOPO l’ultima settimana effettivamente cercata. Usalo se il cliente rifiuta gli slot e dice ‘quella dopo’, ‘la settimana successiva’, ‘ancora la successiva’. Non calcolare date a mano"},
+        "period":{"type":"string","enum":["this_week","next_week","following_last_search_week","same_last_search"],"description":"this_week/next_week sono rispetto a OGGI; following_last_search_week è la settimana DOPO l’ultima settimana effettivamente cercata. same_last_search ripete il periodo appena cercato con filtri diversi (es. «di pomeriggio?»). Questi riferimenti richiedono la memoria della ricerca precedente. Non calcolare date a mano"},
         "week_part":{"type":"string","enum":["start","middle","end"],"description":"Per 'verso fine settimana' usa end"},
         "after_time":{"type":"string"},"before_time":{"type":"string"},"service":{"type":"string"},
         "exclude_previous":{"type":"boolean"}},"required":[],"additionalProperties":False}}},
@@ -102,11 +106,12 @@ TOOLS = [
         "required":["operation"],"additionalProperties":False}}},
 ]
 
-SYSTEM = """Sei l'unico assistente WhatsApp per prenotare, spostare e cancellare appuntamenti.
+SYSTEM = f"""Sei l'unico assistente WhatsApp per prenotare, spostare e cancellare appuntamenti.
 Conversa in italiano in modo breve e chiaro. Comprendi liberamente varianti linguistiche e
 preferenze, senza inventare dati o orari. Oggi e il fuso sono nel contesto.
 Se c'è UN SOLO servizio disponibile, è quello predefinito: NON chiedere al cliente quale servizio vuole. 'Appuntamento' è una richiesta generica e non il nome di un servizio.
-Per 'settimana prossima' riferita a OGGI usa search_slots(period='next_week'); per 'verso fine settimana prossima' usa anche week_part='end'. Se il cliente ha appena visto orari per un periodo e chiede 'la settimana dopo', 'quella successiva' o espressioni equivalenti, il riferimento è L'ULTIMA SETTIMANA CERCATA, non oggi: usa search_slots(period='following_last_search_week'). Se conserva la preferenza 'fine settimana', usa week_part='end'. Anche richieste successive di avanzamento vanno riferite all'ultima ricerca effettuata. Non calcolare manualmente le date relative.
+Per 'settimana prossima' riferita a OGGI usa search_slots(period='next_week'); per 'verso fine settimana prossima' usa anche week_part='end'. Se il cliente ha appena visto orari per un periodo e chiede 'la settimana dopo', 'quella successiva' o espressioni equivalenti, il riferimento è L'ULTIMA SETTIMANA CERCATA, non oggi: usa search_slots(period='following_last_search_week'). Conserva le preferenze precedenti (porzione di settimana e fascia oraria) finché il cliente non le modifica. Anche richieste successive di avanzamento vanno riferite all'ultima ricerca effettuata. Se il cliente cambia solo fascia oraria (es. «di pomeriggio?»), usa search_slots(period='same_last_search', after_time='{AFTERNOON_START}') mantenendo i giorni della ricerca appena effettuata. Non calcolare manualmente le date relative.
+Le fasce dello studio sono: mattina prima delle {AFTERNOON_START}; pomeriggio dalle {AFTERNOON_START} fino a prima delle {EVENING_START}; sera dalle {EVENING_START} in poi. Se il cliente chiede solo una fascia, imposta after_time e before_time coerenti con questi confini: mattina before_time='{AFTERNOON_START}', pomeriggio after_time='{AFTERNOON_START}' e before_time='{EVENING_START}', sera after_time='{EVENING_START}'. I confini di after_time sono inclusivi e quelli di before_time esclusivi. Quando il cliente cambia soltanto fascia, usa same_last_search. Non proporre le 12:30 come pomeriggio.
 Non dichiarare mai 'non ci sono disponibilità' sulla base di un errore di tool; distingui errori da assenza di risultati. Se il tool restituisce zero slot, di' soltanto che non ne hai trovati nell'intervallo verificato, indicando l'intervallo.
 Se l'utente chiede di spostare ma non dice QUANDO, domanda prima la preferenza;
 NON immaginare un giorno o un orario. Chiedi una sola informazione utile per volta.
@@ -176,10 +181,62 @@ def _remember(state, user_message, reply):
 
 def new_state(raw=None):
     if isinstance(raw, dict) and raw.get("version") == "simple-agent-1":
-        return {**raw, "history": list(raw.get("history") or [])[-MAX_HISTORY:],
-                "seen_slots": list(raw.get("seen_slots") or [])[-120:]}
+        state = {**raw, "history": list(raw.get("history") or [])[-MAX_HISTORY:],
+                 "seen_slots": list(raw.get("seen_slots") or [])[-120:]}
+        # Compatibilità con stati salvati dalle prime versioni senza ancora
+        # last_search_window, oppure con un campo parzialmente cancellato.
+        if not _valid_search_window(state.get("last_search_window")):
+            state["last_search_window"] = _recover_search_window(state)
+        return state
     return {"version": "simple-agent-1", "history": [], "seen_slots": [],
             "last_slots": [], "last_search_service": None, "last_search_window": None, "pending": None}
+
+
+def _valid_search_window(window):
+    if not isinstance(window, dict):
+        return False
+    try:
+        return Date.fromisoformat(window["date_from"]) <= Date.fromisoformat(window["date_to"])
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def _recover_search_window(state):
+    """Ripristina l'ancora temporale da slot realmente restituiti.
+
+    Non inventa mai date da espressioni come 'settimana prossima'. Se non
+    sono rimaste date affidabili, la conversazione deve chiedere chiarimenti.
+    """
+    slots = state.get("last_slots") or []
+    dates = []
+    for slot in slots:
+        try:
+            dates.append(Date.fromisoformat(slot["date"]))
+        except (TypeError, KeyError, ValueError):
+            pass
+    if not dates:
+        return None
+    # Tutti gli slot mostrati devono riferirsi a una sola settimana; se no
+    # non sappiamo quale settimana il cliente intendesse.
+    first_monday = min(dates) - timedelta(days=min(dates).weekday())
+    if any(d - timedelta(days=d.weekday()) != first_monday for d in dates):
+        return None
+    return {"date_from": first_monday.isoformat(),
+            "date_to": (first_monday + timedelta(days=6)).isoformat(),
+            "week_part": None, "recovered_from": "last_slots"}
+
+
+def _search_anchor(state):
+    window = state.get("last_search_window")
+    if _valid_search_window(window):
+        return window
+    recovered = _recover_search_window(state)
+    if recovered:
+        state["last_search_window"] = recovered
+        LOG.warning("SEARCH_ANCHOR_RECOVERED_FROM_SLOTS")
+    else:
+        LOG.warning("SEARCH_ANCHOR_MISSING: context_v2 non contiene last_search_window o last_slots")
+    return recovered
 
 
 def _public_slots(rows):
@@ -192,11 +249,13 @@ def _resolved_window(args: SearchArgs, today: Date, last_search_window=None):
         monday = today - timedelta(days=today.weekday())
         if args.period == "next_week":
             monday += timedelta(days=7)
-        elif args.period == "following_last_search_week":
-            if not isinstance(last_search_window, dict) or not last_search_window.get("date_to"):
-                raise ValueError("Non è presente una ricerca precedente a cui riferire la settimana successiva: chiedere chiarimenti")
+        elif args.period in ("following_last_search_week", "same_last_search"):
+            if not _valid_search_window(last_search_window):
+                raise ValueError("Riferimento temporale precedente non disponibile nel contesto persistito: chiedere un giorno preciso, non ripartire da oggi")
             last_end = Date.fromisoformat(last_search_window["date_to"])
-            monday = last_end - timedelta(days=last_end.weekday()) + timedelta(days=7)
+            monday = last_end - timedelta(days=last_end.weekday())
+            if args.period == "following_last_search_week":
+                monday += timedelta(days=7)
         offsets = {None:(0, 6), "start":(0, 2), "middle":(2, 4), "end":(3, 6)}
         first, last = offsets[args.week_part]
         return monday + timedelta(days=first), monday + timedelta(days=last)
@@ -222,10 +281,17 @@ def _execute_tool(name, payload, state, tenant, customer, knowledge, now):
                 "working_hours": (knowledge.get("working_hours") or [])[:30]}
     if name == "search_slots":
         args = SearchArgs.model_validate(payload)
-        if args.period == "following_last_search_week" and args.week_part is None:
-            prior = state.get("last_search_window") or {}
-            if prior.get("week_part") in ("start", "middle", "end"):
-                args = args.model_copy(update={"week_part": prior["week_part"]})
+        if args.period in ("following_last_search_week", "same_last_search"):
+            prior = _search_anchor(state) or {}
+            inherited = {}
+            if args.week_part is None and prior.get("week_part") in ("start", "middle", "end"):
+                inherited["week_part"] = prior["week_part"]
+            if args.after_time is None and prior.get("after_time"):
+                inherited["after_time"] = prior["after_time"]
+            if args.before_time is None and prior.get("before_time"):
+                inherited["before_time"] = prior["before_time"]
+            if inherited:
+                args = args.model_copy(update=inherited)
         date_from, date_to = _resolved_window(args, now.date(), state.get("last_search_window"))
         if date_from < now.date() or date_to > now.date() + timedelta(days=90):
             raise ValueError("Date passate o fuori orizzonte")
@@ -254,7 +320,10 @@ def _execute_tool(name, payload, state, tenant, customer, knowledge, now):
         slots = [s for s in slots if f'{s["date"]}_{s["time"]}' not in seen][:3]
         state["last_slots"] = slots
         state["last_search_service"] = service
-        state["last_search_window"] = {"date_from": date_from.isoformat(), "date_to": date_to.isoformat(), "week_part": args.week_part}
+        state["last_search_window"] = {"date_from": date_from.isoformat(), "date_to": date_to.isoformat(),
+                                       "week_part": args.week_part, "after_time": args.after_time,
+                                       "before_time": args.before_time}
+        LOG.info("SEARCH_WINDOW_SAVED date_from=%s date_to=%s part=%s", date_from, date_to, args.week_part)
         for slot in slots:
             key = f'{slot["date"]}_{slot["time"]}'
             if key not in state["seen_slots"]: state["seen_slots"].append(key)
@@ -391,6 +460,7 @@ def respond(state, message, button_id, tenant, customer, knowledge, client=None)
     if client is None:
         from openai import OpenAI
         client = OpenAI(api_key=Config.OPENAI_API_KEY, timeout=20)
+    _search_anchor(state) if (state.get("last_slots") and not _valid_search_window(state.get("last_search_window"))) else None
     history = [{"role":"system","content":SYSTEM},
                {"role":"system","content":json.dumps({"today":now.date().isoformat(),
                     "timezone":str(tz),"business":tenant.get("business_name"),
