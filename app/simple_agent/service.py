@@ -61,6 +61,21 @@ class SearchArgs(BaseModel):
         return self
 
 
+class AppointmentLookupArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    date: Date | None = None
+    time: str | None = None
+    service: str | None = None
+    page: int = Field(default=1, ge=1, le=10000)
+
+    @model_validator(mode="after")
+    def check(self):
+        from datetime import time as Time
+        if self.time:
+            Time.fromisoformat(self.time)
+        return self
+
+
 class ProposeArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
     operation: str
@@ -84,8 +99,13 @@ class ProposeArgs(BaseModel):
 
 TOOLS = [
     {"type":"function", "function":{"name":"list_appointments",
-      "description":"Consulta i soli appuntamenti futuri del cliente WhatsApp autenticato.",
-      "parameters":{"type":"object","properties":{},"additionalProperties":False}}},
+      "description":"Cerca appuntamenti FUTURI confermati del cliente autenticato. Se il cliente specifica una data (es. 'quello del 3 dicembre'), passa date=YYYY-MM-DD: NON usare un elenco generale per dichiararlo inesistente. Per lista completa usa page e has_more.",
+      "parameters":{"type":"object","properties":{
+          "date":{"type":"string","description":"YYYY-MM-DD, per appuntamento in giorno specifico"},
+          "time":{"type":"string","description":"HH:MM, opzionale"},
+          "service":{"type":"string"},
+          "page":{"type":"integer","minimum":1}},
+          "additionalProperties":False}}},
     {"type":"function", "function":{"name":"business_info",
       "description":"Leggi servizi, durata, orari e informazioni pubbliche dello studio.",
       "parameters":{"type":"object","properties":{},"additionalProperties":False}}},
@@ -117,7 +137,7 @@ Se l'utente chiede di spostare ma non dice QUANDO, domanda prima la preferenza;
 NON immaginare un giorno o un orario. Chiedi una sola informazione utile per volta.
 Usa esclusivamente strumenti per conoscere appuntamenti, servizi e disponibilità.
 Non affermare mai che una modifica sia eseguita finché il backend non ne dà esito.
-Se ci sono più appuntamenti, chiarisci quale il cliente desidera modificare.
+Se ci sono più appuntamenti, chiarisci quale il cliente desidera modificare. Se il cliente indica un giorno per identificare un appuntamento, chiama list_appointments con date di quel giorno, anche se un precedente elenco generale non lo mostrava. Non dire 'non risulta' senza interrogazione mirata. Quando has_more è true, l'elenco è parziale: usa page successiva o chiedi il giorno. Usa l'ID esatto restituito da Python per lo spostamento o la cancellazione.
 Quando rifiuta slot, non riproporli spontaneamente; se torna a scegliere espressamente uno slot mostrato prima, usa propose_operation con quella data e ora: Python lo verifica di nuovo. Non dire mai che non è disponibile senza il controllo effettivo.
 Per creare raccogli servizio e intestatario. Il backend proporrà una conferma esplicita, anche via testo.
 Se propose_operation restituisce status='needs_information' con field='person_name',
@@ -295,17 +315,27 @@ def _resolved_window(args: SearchArgs, today: Date, last_search_window=None):
     return args.date_from, args.date_to
 
 
-def _appointments(tenant, customer):
-    rows = appointments.list_upcoming_for_customer(tenant["id"], customer["id"],
-                        limit=10, tz_name=tenant.get("timezone"))
-    return [{k:r.get(k) for k in ("id","appointment_date","appointment_time","service","person_name")}
-            for r in rows]
+def _appointments(tenant, customer, *, date=None, time=None, service=None, page=1):
+    return appointments.find_upcoming_for_customer(
+        tenant["id"], customer["id"], date=date, time=time,
+        service=service, page=page, tz_name=tenant.get("timezone"))
+
+
+def _owned_appointment(tenant, customer, appointment_id):
+    # Verifica mirata per ID: non dipende dal numero di risultati di una lista.
+    result = appointments.find_upcoming_for_customer(
+        tenant["id"], customer["id"], appointment_id=appointment_id,
+        page_size=1, tz_name=tenant.get("timezone"))
+    rows = result["appointments"]
+    return rows[0] if rows else None
 
 
 def _execute_tool(name, payload, state, tenant, customer, knowledge, now):
     if name == "list_appointments":
-        if payload: raise ValueError("Argomenti non ammessi")
-        return {"appointments": _appointments(tenant, customer)}
+        args = AppointmentLookupArgs.model_validate(payload)
+        return _appointments(tenant, customer,
+                             date=args.date.isoformat() if args.date else None,
+                             time=args.time, service=args.service, page=args.page)
     if name == "business_info":
         if payload: raise ValueError("Argomenti non ammessi")
         return {"business_name": tenant.get("business_name"),
@@ -380,16 +410,20 @@ def _execute_tool(name, payload, state, tenant, customer, knowledge, now):
         args = ProposeArgs.model_validate(payload)
         if state.get("pending"):
             return {"error":"Proposta precedente in attesa: prima rifiutare o confermare."}
-        own = {str(a["id"]):a for a in _appointments(tenant, customer)}
-        if args.operation in ("cancel", "reschedule") and (not args.appointment_id or args.appointment_id not in own):
-            return {"error":"Appuntamento assente o non appartenente al cliente"}
+        own_appointment = None
+        if args.operation in ("cancel", "reschedule"):
+            if not args.appointment_id:
+                return {"error": "Indicare l'ID dell'appuntamento da modificare"}
+            own_appointment = _owned_appointment(tenant, customer, args.appointment_id)
+            if not own_appointment:
+                return {"error": "Appuntamento futuro confermato assente o non appartenente al cliente"}
         service = None
         if args.operation != "cancel":
             chosen = {"date": args.date.isoformat(), "time": args.time[:5]}
             services = knowledge.get("services") or []
             requested_service = (args.service or "").strip()
             if args.operation == "reschedule":
-                requested_service = (own[args.appointment_id].get("service") or requested_service).strip()
+                requested_service = (own_appointment.get("service") or requested_service).strip()
             if len(services) == 1 and not requested_service:
                 requested_service = (services[0].get("name") or "").strip()
             service = next((s for s in services if (s.get("name") or "").casefold() == requested_service.casefold()), None)
