@@ -112,7 +112,7 @@ preferenze, senza inventare dati o orari. Oggi e il fuso sono nel contesto.
 Se c'è UN SOLO servizio disponibile, è quello predefinito: NON chiedere al cliente quale servizio vuole. 'Appuntamento' è una richiesta generica e non il nome di un servizio.
 Per 'settimana prossima' riferita a OGGI usa search_slots(period='next_week'); per 'verso fine settimana prossima' usa anche week_part='end'. Se il cliente ha appena visto orari per un periodo e chiede 'la settimana dopo', 'quella successiva' o espressioni equivalenti, il riferimento è L'ULTIMA SETTIMANA CERCATA, non oggi: usa search_slots(period='following_last_search_week'). Conserva le preferenze precedenti (porzione di settimana e fascia oraria) finché il cliente non le modifica. Anche richieste successive di avanzamento vanno riferite all'ultima ricerca effettuata. Se il cliente cambia solo fascia oraria (es. «di pomeriggio?»), usa search_slots(period='same_last_search', after_time='{AFTERNOON_START}') mantenendo i giorni della ricerca appena effettuata. Non calcolare manualmente le date relative.
 Le fasce dello studio sono: mattina prima delle {AFTERNOON_START}; pomeriggio dalle {AFTERNOON_START} fino a prima delle {EVENING_START}; sera dalle {EVENING_START} in poi. Se il cliente chiede solo una fascia, imposta after_time e before_time coerenti con questi confini: mattina before_time='{AFTERNOON_START}', pomeriggio after_time='{AFTERNOON_START}' e before_time='{EVENING_START}', sera after_time='{EVENING_START}'. I confini di after_time sono inclusivi e quelli di before_time esclusivi. Quando il cliente cambia soltanto fascia, usa same_last_search. Non proporre le 12:30 come pomeriggio.
-Non dichiarare mai 'non ci sono disponibilità' sulla base di un errore di tool; distingui errori da assenza di risultati. Se il tool restituisce zero slot, di' soltanto che non ne hai trovati nell'intervallo verificato, indicando l'intervallo.
+Non dichiarare mai 'non ci sono disponibilità' sulla base di un errore di tool; distingui errori da assenza di risultati. Quando comunichi una ricerca effettuata, nomina SEMPRE la fascia oraria effettivamente applicata dal backend, anche se non ci sono disponibilità. La fascia della ricerca successiva resta quella precedente se il cliente cambia soltanto settimana; non ometterla nelle risposte.
 Se l'utente chiede di spostare ma non dice QUANDO, domanda prima la preferenza;
 NON immaginare un giorno o un orario. Chiedi una sola informazione utile per volta.
 Usa esclusivamente strumenti per conoscere appuntamenti, servizi e disponibilità.
@@ -251,6 +251,31 @@ def _public_slots(rows):
     return [{"date":str(s.get("date")),"time":str(s.get("time"))[:5]} for s in rows]
 
 
+def _search_fascia(after_time, before_time):
+    """Etichetta informativa derivata dai filtri REALI applicati dal backend."""
+    if after_time == AFTERNOON_START and before_time in (None, EVENING_START):
+        return "di pomeriggio" if before_time == EVENING_START else f"dalle {AFTERNOON_START} in poi"
+    if after_time == EVENING_START and before_time is None:
+        return "di sera"
+    if after_time is None and before_time == AFTERNOON_START:
+        return "di mattina"
+    if after_time or before_time:
+        start = f"dalle {after_time}" if after_time else ""
+        end = f"prima delle {before_time}" if before_time else ""
+        return " ".join(x for x in (start, end) if x)
+    return "senza vincoli di fascia oraria"
+
+
+def _search_report(result):
+    """Report vincolato all'ultima ricerca: nessuna fascia può essere omessa."""
+    fascia = result["fascia"]
+    periodo = f"dal {result['searched_from']} al {result['searched_to']}"
+    if result["status"] == "not_found_in_requested_window":
+        return (f"Non ho trovato appuntamenti disponibili {fascia} {periodo}. "
+                "Vuoi provare un'altra settimana o cambiare fascia oraria?")
+    return f"Ricerca effettuata {fascia} {periodo}."
+
+
 def _resolved_window(args: SearchArgs, today: Date, last_search_window=None):
     """Date relative calcolate esclusivamente dal backend, nel fuso dello studio."""
     if args.period:
@@ -347,6 +372,9 @@ def _execute_tool(name, payload, state, tenant, customer, knowledge, now):
         return {"slots":slots, "count":len(slots),
                 "searched_from":date_from.isoformat(),"searched_to":date_to.isoformat(),
                 "service":service,
+                "applied_filters": {"after_time":args.after_time, "before_time":args.before_time,
+                                    "week_part":args.week_part},
+                "fascia": _search_fascia(args.after_time, args.before_time),
                 "status":"ok" if slots else "not_found_in_requested_window"}
     if name == "propose_operation":
         args = ProposeArgs.model_validate(payload)
@@ -592,6 +620,7 @@ def respond(state, message, button_id, tenant, customer, knowledge, client=None)
     history.append({"role":"user","content":message[:1500]})
     text = "Mi dica quale giorno o fascia oraria preferisce, così posso verificare le disponibilità."
     used = 0
+    latest_search = None
     for _ in range(MAX_CALLS + 1):
         answer = client.chat.completions.create(model=Config.AI_MODEL_INTENT,
                  messages=history, tools=TOOLS, tool_choice="auto", temperature=0)
@@ -610,6 +639,8 @@ def respond(state, message, button_id, tenant, customer, knowledge, client=None)
                     data = json.loads(call.function.arguments or "{}")
                     if not isinstance(data,dict): raise ValueError("Parametri invalidi")
                     output = _execute_tool(call.function.name, data, state, tenant,customer,knowledge,now)
+                    if call.function.name == "search_slots" and output.get("status") in ("ok", "not_found_in_requested_window"):
+                        latest_search = output
                 except (ValueError, ValidationError,TypeError,KeyError) as exc:
                     output = {"error":str(exc)[:200]}
             history.append({"role":"tool","tool_call_id":call.id,
@@ -624,5 +655,16 @@ def respond(state, message, button_id, tenant, customer, knowledge, client=None)
         buttons = _pending_buttons(p)
     else:
         buttons = None
+        if latest_search is not None:
+            # Il testo dell'AI non è la fonte autorevole dei filtri realmente applicati.
+            # Per ricerche vuote il riepilogo deriva solo da Python, non da una deduzione LLM.
+            if latest_search["status"] == "not_found_in_requested_window":
+                text = _search_report(latest_search)
+            else:
+                fascia = latest_search["fascia"]
+                # Una breve intestazione garantisce trasparenza senza riscrivere
+                # l'elenco degli slot validi già comunicato dall'AI.
+                if fascia not in text.casefold():
+                    text = _search_report(latest_search) + " " + text
     _remember(state, message, text)
     return state,text,buttons
