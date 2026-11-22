@@ -177,6 +177,69 @@ def list_upcoming_for_customer(
     return upcoming[:limit]
 
 
+def find_upcoming_for_customer(
+    tenant_id: str,
+    customer_id: str,
+    *,
+    date: str | None = None,
+    time: str | None = None,
+    service: str | None = None,
+    appointment_id: str | None = None,
+    page: int = 1,
+    page_size: int = 20,
+    tz_name: str | None = None,
+) -> dict:
+    """Lookup mirato e paginato; mai usare un elenco troncato per autorizzare operazioni.
+
+    Il tenant e il cliente sono SEMPRE quelli risolti dal backend, mai dall'AI.
+    Restituisce has_more per evitare che una pagina venga scambiata per l'intero elenco.
+    """
+    from datetime import time as Time
+    from uuid import UUID
+
+    if not 1 <= page <= 10000 or not 1 <= page_size <= 50:
+        raise ValueError("Paginazione non valida")
+    if date is not None:
+        date = __import__('datetime').date.fromisoformat(date).isoformat()
+    if time is not None:
+        time = Time.fromisoformat(time).strftime('%H:%M:%S')
+    if appointment_id is not None:
+        appointment_id = str(UUID(str(appointment_id)))
+    if service is not None:
+        service = service.strip()
+        if not service:
+            service = None
+
+    now = datetime.now(_resolve_tz(tz_name))
+    today = now.date().isoformat()
+    if date and date < today:
+        return {"appointments": [], "has_more": False, "page": page}
+
+    q = (get_supabase().table("appointments")
+         .select("id, appointment_date, appointment_time, service, person_name")
+         .eq("tenant_id", tenant_id)
+         .eq("customer_id", customer_id)
+         .eq("status", "confirmed")
+         .gte("appointment_date", today))
+    if date:
+        q = q.eq("appointment_date", date)
+    if time:
+        q = q.eq("appointment_time", time)
+    if service:
+        q = q.eq("service", service)
+    if appointment_id:
+        q = q.eq("id", appointment_id)
+
+    # Filtro oggi anche a livello SQL, prima di paginare.
+    # I giorni successivi non richiedono il filtro sull'ora.
+    current_time = now.strftime('%H:%M:%S')
+    q = q.or_(f"appointment_date.gt.{today},and(appointment_date.eq.{today},appointment_time.gt.{current_time})")
+    offset = (page - 1) * page_size
+    rows = (q.order("appointment_date").order("appointment_time")
+            .range(offset, offset + page_size).execute().data or [])
+    return {"appointments": rows[:page_size], "has_more": len(rows) > page_size, "page": page}
+
+
 # ============================================================
 # SCRITTURA
 # ============================================================
