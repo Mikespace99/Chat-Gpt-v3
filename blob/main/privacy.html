@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Informativa sulla Privacy - AI Booking Simple</title>
+    
+    <!-- Meta tag richiesti dal Crawler di Meta (Facebook) per validare l'URL -->
+    <meta property="og:title" content="Informativa sulla Privacy - AI Booking Simple" />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://github.io" />
+    <meta property="og:description" content="Informativa sulla privacy per l'applicazione AI Booking Simple (WhatsApp Integration)." />
+    
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; line-height: 1.6; color: #333; max-width: 800px; margin: 0 auto; padding: 20px; }
+        h1 { color: #111; border-bottom: 2px solid #eaeaea; padding-bottom: 10px; }
+        h2 { color: #222; margin-top: 30px; }
+        p, li { color: #555; }
+        ul { padding-left: 20px; }
+        .footer { margin-top: 50px; font-size: 0.85em; color: #777; border-top: 1px solid #eaeaea; padding-top: 20px; }
+    </style>
+</head>
+<body>
+
+    <h1>Informativa sulla Privacy (Privacy Policy)</h1>
+    <p><strong>Ultimo aggiornamento:</strong> 5 Novembre 2026</p>
+
+    <p>La presente Informativa sulla privacy descrive le modalità con cui la nostra applicazione <strong>AI Booking Simple</strong> (di seguito, "l'Applicazione" o "il Servizio") raccoglie, utilizza e protegge i dati personali degli utenti nel contesto dell'integrazione con la piattaforma WhatsApp Cloud API di Meta.</p>
+
+    <h2>1. Titolare del Trattamento dei Dati</h2>
+    <p>Il titolare del trattamento è lo sviluppatore del repository GitHub <em>Mikespace99/LLM-Deepseek</em>. Per qualsiasi richiesta o chiarimento in merito alla gestione dei dati, l'utente può fare riferimento ai canali di contatto ufficiali del profilo GitHub associato.</p>
+
+    <h2>2. Tipologia di Dati Raccolti</h2>
+    <p>L'Applicazione raccoglie ed elabora esclusivamente i dati strettamente necessari all'erogazione del servizio di prenotazione appuntamenti automatizzato:</p>
+    <ul>
+        <li><strong>Dati di contatto su WhatsApp:</strong> Numero di telefono dell'utente e nome del profilo visualizzato su WhatsApp.</li>
+        <li><strong>Contenuto dei messaggi:</strong> Testo inviato dall'utente via chat per l'elaborazione degli intenti di prenotazione tramite modelli di linguaggio (AI).</li>
+        <li><strong>Dati di prenotazione:</strong> Data, orario, dettagli dell'appuntamento ed eventuali preferenze fornite esplicitamente dall'utente.</li>
+    </ul>
+
+    <h2>3. Finalità del Trattamento</h2>
+    <p>I dati forniti vengono trattati per le seguenti ed esclusive finalità:</p>
+    <ul>
+        <li>Ricezione e parsing delle richieste di prenotazione tramite webhook di WhatsApp Cloud API.</li>
+        <li>Sincronizzazione degli appuntamenti sui calendari di destinazione tramite l'automazione n8n (es. Google Calendar).</li>
+        <li>Risposta automatizzata all'utente per confermare, modificare o cancellare gli appuntamenti.</li>
+    </ul>
+
+    <h2>4. Conservazione dei Dati</h2>
+    <p>I dati delle conversazioni e degli stati vengono memorizzati nel nostro database di backend (Supabase) e sono soggetti a una policy di timeout automatica (scadenza della sessione dopo 15 minuti di inattività). Non memorizziamo i dati personali più a lungo di quanto necessario per la gestione tecnica della prenotazione.</p>
+
+    <h2>5. Trasferimento e Comunicazione dei Dati a Terze Parti</h2>
+    <p>I dati non vengono venduti o ceduti a terze parti a scopo di marketing. Per il corretto funzionamento, i dati transitano ed interagiscono con i seguenti fornitori di infrastruttura:</p>
+    <ul>
+        <li><strong>Meta Platforms, Inc.:</strong> Per il transito dei messaggi tramite WhatsApp Cloud API.</li>
+        <li><strong>Supabase / PostgreSQL:</strong> Per il salvataggio dello stato della sessione.</li>
+        <li><strong>OpenAI / Deepseek:</strong> Per il parsing degli intenti della conversazione.</li>
+        <li><strong>n8n / Google Calendar:</strong> Per la finalizzazione dell'appuntamento nel calendario aziendale.</li>
+        <li><strong>Render:</strong> Per l'hosting del codice backend dell'applicazione.</li>
+    </ul>
+
+    <h2>6. Diritti degli Utenti</h2>
+    <p>Gli utenti possono esercitare in qualsiasi momento i diritti previsti dal Regolamento Generale sulla Protezione dei Dati (GDPR), inclusi il diritto di accesso, rettifica, cancellazione o limitazione del trattamento dei propri dati, contattando il Titolare del trattamento tramite la piattaforma GitHub.</p>
+
+    <div class="footer">
+        <p>Questa pagina è ospitata su GitHub Pages ed è configurata al solo scopo di soddisfare i requisiti tecnici e legali di conformità per lo sviluppo e il test delle API di Meta Platforms.</p>
+    </div>
+
+</body>
+</html>
