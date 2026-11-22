@@ -1,0 +1,28 @@
+name: Svuota Repository
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  clean:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Scarica repository
+        uses: actions/checkout@v4
+
+      - name: Elimina tutti i file (tranne questo workflow)
+        run: |
+          find . -mindepth 1 -maxdepth 1 ! -name '.git' ! -name '.github' -exec rm -rf {} +
+          find .github -mindepth 1 -maxdepth 1 ! -name 'workflows' -exec rm -rf {} +
+          find .github/workflows -mindepth 1 -maxdepth 1 ! -name 'svuota-repo.yml' -exec rm -rf {} +
+
+      - name: Salva modifiche
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@://github.com"
+          git add -A
+          git commit -m "Svuota repository" || exit 0
+          git push
