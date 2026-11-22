@@ -1,5 +1,0 @@
-[
-  {"message":"Vorrei prenotare venerdì pomeriggio, quanto costa?", "ai_json":{"requests":[{"intent":"BOOK","entities":{"weekday":"venerdi","time_preference":"afternoon"}},{"intent":"ASK_INFORMATION","entities":{},"topic":"prezzo del servizio"}]}},
-  {"message":"Confermo ma alle 18", "confirmation_required":true,"ai_json":{"requests":[{"intent":"CONFIRM","entities":{}},{"intent":"CHANGE_PREFERENCE","entities":{"exact_time":"18:00"}}]}},
-  {"message":"Confermo", "confirmation_required":false,"ai_json":{"requests":[{"intent":"CONFIRM","entities":{}}]}}
-]
