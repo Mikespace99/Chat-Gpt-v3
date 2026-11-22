@@ -29,8 +29,10 @@ SHOW_CONFIRM_BUTTONS = os.getenv("WHATSAPP_CONFIRM_BUTTONS", "false").lower() in
 
 class SearchArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    date_from: Date
-    date_to: Date
+    date_from: Date | None = None
+    date_to: Date | None = None
+    period: str | None = None
+    week_part: str | None = None
     after_time: str | None = None
     before_time: str | None = None
     service: str | None = None
@@ -38,7 +40,15 @@ class SearchArgs(BaseModel):
 
     @model_validator(mode="after")
     def check(self):
-        if self.date_to < self.date_from or (self.date_to - self.date_from).days > 30:
+        if self.period not in (None, "this_week", "next_week"):
+            raise ValueError("Periodo non valido")
+        if self.week_part not in (None, "start", "middle", "end"):
+            raise ValueError("Porzione della settimana non valida")
+        if self.period and (self.date_from or self.date_to):
+            raise ValueError("Specificare periodo O date esplicite, non entrambi")
+        if not self.period and (not self.date_from or not self.date_to):
+            raise ValueError("Specificare un periodo o entrambe le date")
+        if self.date_from and self.date_to and (self.date_to < self.date_from or (self.date_to - self.date_from).days > 30):
             raise ValueError("Intervallo date non valido (massimo 31 giorni)")
         from datetime import time
         for t in (self.after_time, self.before_time):
@@ -78,9 +88,11 @@ TOOLS = [
     {"type":"function", "function":{"name":"search_slots",
       "description":"Cerca orari REALI, dopo che il cliente ha indicato almeno una preferenza temporale. Per 'altri orari' escludi i già proposti.",
       "parameters":{"type":"object","properties":{
-        "date_from":{"type":"string","description":"YYYY-MM-DD"},"date_to":{"type":"string","description":"YYYY-MM-DD"},
+        "date_from":{"type":"string","description":"YYYY-MM-DD; usare SOLO per date esplicite"},"date_to":{"type":"string","description":"YYYY-MM-DD; usare SOLO per date esplicite"},
+        "period":{"type":"string","enum":["this_week","next_week"],"description":"Per 'settimana prossima' usa next_week senza calcolare date"},
+        "week_part":{"type":"string","enum":["start","middle","end"],"description":"Per 'verso fine settimana' usa end"},
         "after_time":{"type":"string"},"before_time":{"type":"string"},"service":{"type":"string"},
-        "exclude_previous":{"type":"boolean"}},"required":["date_from","date_to"],"additionalProperties":False}}},
+        "exclude_previous":{"type":"boolean"}},"required":[],"additionalProperties":False}}},
     {"type":"function", "function":{"name":"propose_operation",
       "description":"Prepara una proposta senza scrivere il database. Richiede una conferma esplicita (testo naturale o pulsante WhatsApp). Data e ora devono derivare da uno slot effettivamente trovato.",
       "parameters":{"type":"object","properties":{
@@ -93,6 +105,9 @@ TOOLS = [
 SYSTEM = """Sei l'unico assistente WhatsApp per prenotare, spostare e cancellare appuntamenti.
 Conversa in italiano in modo breve e chiaro. Comprendi liberamente varianti linguistiche e
 preferenze, senza inventare dati o orari. Oggi e il fuso sono nel contesto.
+Se c'è UN SOLO servizio disponibile, è quello predefinito: NON chiedere al cliente quale servizio vuole. 'Appuntamento' è una richiesta generica e non il nome di un servizio.
+Per 'settimana prossima' usa search_slots(period='next_week'); 'verso fine settimana prossima' usa anche week_part='end'. Non calcolare manualmente le date relative.
+Non dichiarare mai 'non ci sono disponibilità' sulla base di un errore di tool; distingui errori da assenza di risultati. Se il tool restituisce zero slot, di' soltanto che non ne hai trovati nell'intervallo verificato, indicando l'intervallo.
 Se l'utente chiede di spostare ma non dice QUANDO, domanda prima la preferenza;
 NON immaginare un giorno o un orario. Chiedi una sola informazione utile per volta.
 Usa esclusivamente strumenti per conoscere appuntamenti, servizi e disponibilità.
@@ -171,6 +186,18 @@ def _public_slots(rows):
     return [{"date":str(s.get("date")),"time":str(s.get("time"))[:5]} for s in rows]
 
 
+def _resolved_window(args: SearchArgs, today: Date):
+    """Date relative calcolate esclusivamente dal backend, nel fuso dello studio."""
+    if args.period:
+        monday = today - timedelta(days=today.weekday())
+        if args.period == "next_week":
+            monday += timedelta(days=7)
+        offsets = {None:(0, 6), "start":(0, 2), "middle":(2, 4), "end":(3, 6)}
+        first, last = offsets[args.week_part]
+        return monday + timedelta(days=first), monday + timedelta(days=last)
+    return args.date_from, args.date_to
+
+
 def _appointments(tenant, customer):
     rows = appointments.list_upcoming_for_customer(tenant["id"], customer["id"],
                         limit=10, tz_name=tenant.get("timezone"))
@@ -190,25 +217,42 @@ def _execute_tool(name, payload, state, tenant, customer, knowledge, now):
                 "working_hours": (knowledge.get("working_hours") or [])[:30]}
     if name == "search_slots":
         args = SearchArgs.model_validate(payload)
-        if args.date_from < now.date() or args.date_to > now.date() + timedelta(days=90):
+        date_from, date_to = _resolved_window(args, now.date())
+        if date_from < now.date() or date_to > now.date() + timedelta(days=90):
             raise ValueError("Date passate o fuori orizzonte")
-        # Always require explicit search criteria from model; engine itself is source of truth.
+        services = knowledge.get("services") or []
+        service = args.service
+        if len(services) == 1:
+            # Una scelta unica non deve diventare una domanda al cliente.
+            if service and service.casefold().strip() not in (services[0].get("name") or "").casefold().strip():
+                raise ValueError("Servizio non riconosciuto: usare il servizio configurato")
+            service = services[0].get("name")
+        elif not service:
+            return {"status":"needs_service", "services":[s.get("name") for s in services]}
+        elif not any((s.get("name") or "").casefold() == service.casefold() for s in services):
+            return {"status":"invalid_service", "services":[s.get("name") for s in services]}
         seen = set(state["seen_slots"]) if args.exclude_previous else set()
         result = engine.search_availability(tenant, knowledge, {
-            "service": args.service,
-            "preferences": {"date_from": args.date_from.isoformat(), "date_to": args.date_to.isoformat(),
+            "service": service,
+            "preferences": {"date_from": date_from.isoformat(), "date_to": date_to.isoformat(),
                 "after_time": args.after_time, "before_time": args.before_time,
                 "excluded_slots": sorted(seen)},
         })
-        all_slots = _public_slots(result.get("candidate_slots") or [])
-        slots = [s for s in all_slots if f'{s["date"]}_{s["time"]}' not in seen][:3]
+        # Non trasformare eventuali risposte incomplete del motore in 'agenda piena'.
+        if not isinstance(result, dict) or not isinstance(result.get("candidate_slots"), list):
+            return {"status":"search_error", "message":"Ricerca non verificabile"}
+        slots = _public_slots(result["candidate_slots"])
+        slots = [s for s in slots if f'{s["date"]}_{s["time"]}' not in seen][:3]
         state["last_slots"] = slots
-        state["last_search_service"] = args.service
+        state["last_search_service"] = service
         for slot in slots:
             key = f'{slot["date"]}_{slot["time"]}'
             if key not in state["seen_slots"]: state["seen_slots"].append(key)
         state["seen_slots"] = state["seen_slots"][-120:]
-        return {"slots":slots, "count":len(slots),"status":"ok" if slots else "not_found"}
+        return {"slots":slots, "count":len(slots),
+                "searched_from":date_from.isoformat(),"searched_to":date_to.isoformat(),
+                "service":service,
+                "status":"ok" if slots else "not_found_in_requested_window"}
     if name == "propose_operation":
         args = ProposeArgs.model_validate(payload)
         if state.get("pending"):
@@ -340,6 +384,7 @@ def respond(state, message, button_id, tenant, customer, knowledge, client=None)
     history = [{"role":"system","content":SYSTEM},
                {"role":"system","content":json.dumps({"today":now.date().isoformat(),
                     "timezone":str(tz),"business":tenant.get("business_name"),
+                    "available_services":[sv.get("name") for sv in (knowledge.get("services") or [])],
                     "last_slots":state["last_slots"],"previously_shown_slots":state["seen_slots"][-40:]},
                     ensure_ascii=False)}]
     history += state["history"][-MAX_HISTORY:]
