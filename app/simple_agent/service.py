@@ -436,6 +436,44 @@ def _present(p):
     return f"Conferma la prenotazione di {p['service']} per {p['person_name']} il {p['date']} alle {p['time']}?"
 
 
+# Solo errori esplicitamente RIFIUTATI da PostgREST sono definitivi.
+# Un timeout o una risposta persa rimane incerta: in quel caso l'operation_id
+# è conservato e un eventuale retry è idempotente.
+_DEFINITIVE_DB_MESSAGES = {
+    "too_many_person_names": (
+        "Questo numero ha raggiunto il precedente limite sui nominativi. "
+        "La configurazione del database deve essere aggiornata prima di riprovare."
+    ),
+    "too_many_upcoming_appointments": (
+        "Per questo numero WhatsApp ci sono già due appuntamenti futuri. "
+        "Per prenotarne un altro bisogna prima modificarne o cancellarne uno."
+    ),
+    "appointment_in_past": "La data scelta è ormai trascorsa. Indichi un nuovo orario.",
+    "appointment_not_found_or_not_owned": (
+        "L'appuntamento non risulta più modificabile per questo numero. "
+        "Verifichiamo gli appuntamenti attivi."
+    ),
+    "inactive_or_foreign_service": "Il servizio scelto non è più disponibile. Scegliamone un altro.",
+    "inactive_or_foreign_location": "La sede scelta non è più disponibile. Verifichiamo la sede.",
+    "missing_booking_fields": "Mancano dati necessari per completare la prenotazione. Ricominciamo dalla proposta.",
+    "invalid_duration": "La durata configurata per questo servizio non è valida. Occorre correggere la configurazione.",
+    "23505": "La richiesta è in conflitto con un dato già registrato. Verifichiamo l'agenda.",
+    "23P01": "L'orario è stato occupato da un altro appuntamento. Scegliamone un altro.",
+}
+
+
+def _definitive_db_failure(exc):
+    """Messaggio al cliente solo per errori SQL/PostgREST noti e definitivi."""
+    cls = type(exc)
+    if cls.__name__ != "APIError" or not cls.__module__.startswith("postgrest"):
+        return None
+    raw = exc.args[0] if exc.args else None
+    payload = raw if isinstance(raw, dict) else {}
+    message = str(payload.get("message") or getattr(exc, "message", "")).strip()
+    code = str(payload.get("code") or getattr(exc, "code", "")).strip()
+    return _DEFINITIVE_DB_MESSAGES.get(message) or _DEFINITIVE_DB_MESSAGES.get(code)
+
+
 def _confirm(state, button_id, tenant, customer, now, knowledge=None):
     p = state.get("pending")
     if not p or button_id not in (f'confirm:{p["id"]}', f'reject:{p["id"]}'):
@@ -488,9 +526,15 @@ def _confirm(state, button_id, tenant, customer, now, knowledge=None):
         state["last_slots"] = []
         return "Operazione completata e registrata. Grazie!", None
     except Exception as exc:
-        LOG.exception("Operazione confermata non riuscita (%s)",type(exc).__name__)
-        # Don't throw away a confirmed operation on an uncertain RPC result:
-        # retry with the SAME proposal UUID, for RPC idempotency.
+        definite_message = _definitive_db_failure(exc)
+        if definite_message:
+            # Postgres ha rifiutato la transazione: non ci sono scritture
+            # da recuperare e NON si deve chiedere «confermo» di nuovo.
+            LOG.warning("BOOKING_REJECTED_BY_DB reason=%s", str(exc.args[0].get("message") if exc.args and isinstance(exc.args[0], dict) else type(exc).__name__))
+            state["pending"] = None
+            return definite_message, None
+        LOG.exception("Operazione confermata non riuscita (%s)", type(exc).__name__)
+        # Solo per esito incerto: conserva il medesimo operation_id idempotente.
         return "Non posso ancora verificare l’esito. Non invii una nuova richiesta: risponda «confermo» per ritentare la verifica della stessa operazione.", p
 
 
