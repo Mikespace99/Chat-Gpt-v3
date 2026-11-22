@@ -43,6 +43,16 @@ ITALIAN_MONTHS = [
 
 MAX_CANDIDATE_SLOTS = 3
 
+# Unica definizione delle fasce orarie, usata da motore e agente AI.
+# Intervalli [inizio, fine): un appuntamento alle 14:00 è pomeriggio,
+# uno alle 18:00 è sera; le 12:30 sono mattina.
+TIME_BANDS = {
+    "morning": (0, 14),
+    "afternoon": (14, 18),
+    "evening": (18, 24),
+}
+
+
 _WEEKDAY_NAME_TO_ISO = {
     "lunedì": 1,
     "martedì": 2,
@@ -319,22 +329,11 @@ def _compute_search_window(ctx: dict) -> dict:
     if not ignore_prefs:
         time_preference = prefs.get("time_preference")
 
-        if time_preference == "morning":
+        if time_preference in TIME_BANDS:
+            start_hour, end_hour = TIME_BANDS[time_preference]
             preferred_window = {
-                "start_hour": 6,
-                "end_hour": 12,
-            }
-
-        elif time_preference == "afternoon":
-            preferred_window = {
-                "start_hour": 12,
-                "end_hour": 18,
-            }
-
-        elif time_preference == "evening":
-            preferred_window = {
-                "start_hour": 18,
-                "end_hour": 21,
+                "start_hour": start_hour,
+                "end_hour": end_hour,
             }
 
         elif (
@@ -812,7 +811,7 @@ def _generate_and_filter_slots(
         filtered = [s for s in filtered if not _is_excluded(s)]
 
     # ============================================================
-    # NUOVO: "più tardi" → prendi solo orari DOPO after_time
+    # Soglia inclusiva: "dalle 14:00" comprende anche le 14:00
     # ============================================================
     after_time = prefs.get("after_time")  # es. "10:00"
     if after_time:
@@ -822,7 +821,7 @@ def _generate_and_filter_slots(
 
             filtered = [
                 s for s in filtered
-                if (s["start"].hour * 60 + s["start"].minute) > after_minutes
+                if (s["start"].hour * 60 + s["start"].minute) >= after_minutes
             ]
             print(
                 f"[ENGINE] after_time={after_time} -> "
@@ -1195,7 +1194,7 @@ def search_available_days(
     """
     Restituisce i primi `max_days` giorni con almeno uno slot libero
     nei prossimi slot_search_days del tenant, con indicazione
-    mattina (< 13:00) / pomeriggio (>= 13:00).
+    mattina (< 14:00), pomeriggio (14:00–17:59), sera (>= 18:00).
 
     Ritorno:
     {
@@ -1205,6 +1204,7 @@ def search_available_days(
           "label": "Martedì 9 settembre",
           "morning": True,
           "afternoon": False,
+          "evening": False,
         },
         ...
       ],
@@ -1279,8 +1279,8 @@ def search_available_days(
         # (già troncati da _generate_and_filter_slots): se un giorno ha
         # 3+ slot di mattina, il pomeriggio non verrebbe mai nemmeno
         # controllato. Due interrogazioni mirate, una per fascia.
-        morning = afternoon = False
-        for period in ("morning", "afternoon"):
+        morning = afternoon = evening = False
+        for period in TIME_BANDS:
             period_prefs = {"date": date_str, "date_from": date_str, "date_to": date_str, "time_preference": period}
             period_collected = dict(wide)
             period_collected["preferences"] = period_prefs
@@ -1288,8 +1288,10 @@ def search_available_days(
             period_slots = _generate_and_filter_slots(period_ctx, busy_events).get("candidate_slots") or []
             if period == "morning":
                 morning = bool(period_slots)
-            else:
+            elif period == "afternoon":
                 afternoon = bool(period_slots)
+            else:
+                evening = bool(period_slots)
 
         try:
             dt = datetime.strptime(date_str[:10], "%Y-%m-%d")
@@ -1304,6 +1306,7 @@ def search_available_days(
             "label": label,
             "morning": morning,
             "afternoon": afternoon,
+            "evening": evening,
         })
 
     return {
