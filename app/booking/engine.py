@@ -841,9 +841,14 @@ def _generate_and_filter_slots(
             if slot["start"].hour * 60 + slot["start"].minute < before_minutes
         ]
 
-    top = filtered[:MAX_CANDIDATE_SLOTS]
+    # Verifica puntuale: la stessa identica pipeline della ricerca, ma con
+    # uno slot mirato prima di applicare il limite di 3 risultati.
+    target = ctx.get("target_slot")
+    if target:
+        filtered = [slot for slot in filtered
+                    if slot["start"].date().isoformat() == target["date"]
+                    and slot["start"].strftime("%H:%M") == target["time"]]
 
-    
     top = filtered[:MAX_CANDIDATE_SLOTS]
 
     candidate_slots = []
@@ -949,103 +954,44 @@ def search_availability(
     )
 
 
-def revalidate_slots(
-    tenant: dict,
-    knowledge: dict,
-    collected_data: dict,
-    slots: list[dict],
-) -> list[dict]:
+def validate_exact_slot(tenant: dict, knowledge: dict, service: str,
+                        slot: dict) -> dict:
+    """Unica fonte di verità: usa gli stessi controlli della ricerca pubblica.
+
+    Non eredita filtri conversazionali o slot esclusi. Non confonde la
+    troncatura ai primi tre risultati con l'occupazione del calendario.
     """
-    Riverifica che una lista di slot proposti in un turno precedente
-    sia ANCORA libera adesso (nessuna prenotazione concorrente nel
-    frattempo, nessuno slot ormai nel passato o sotto il min_lead_hours).
+    from datetime import time as Time
+    try:
+        day = date.fromisoformat(str(slot["date"])[:10])
+        at = Time.fromisoformat(str(slot["time"])[:5]).strftime("%H:%M")
+    except (KeyError, TypeError, ValueError):
+        return {"status": "invalid_slot"}
+    if not _match_service(knowledge.get("services") or [], service):
+        return {"status": "invalid_service"}
+    ctx = _build_context(tenant, knowledge, {
+        "service": service,
+        "preferences": {"date_from": day.isoformat(), "date_to": day.isoformat()},
+    })
+    ctx = _compute_search_window(ctx)
+    ctx["target_slot"] = {"date": day.isoformat(), "time": at}
+    busy = appointment_repo.list_busy_for_availability(
+        tenant_id=ctx["tenant_id"], date_from=day.isoformat(),
+        date_to=day.isoformat())
+    result = _generate_and_filter_slots(ctx, busy)
+    found = any(s["date"] == day.isoformat() and s["time"] == at
+                for s in result["candidate_slots"])
+    return {"status": "available" if found else "unavailable",
+            "date": day.isoformat(), "time": at}
 
-    Usata dal fallback "ti ripropongo le opzioni di prima": il backend,
-    non l'AI, decide quali orari sono davvero ancora disponibili.
-    L'AI Redattrice non deve mai riscrivere a mano date/orari già
-    proposti, perché nel frattempo potrebbero non essere più validi.
-    """
-    if not slots:
-        return []
 
-    ctx = _build_context(tenant, knowledge, collected_data)
-    tz = ZoneInfo(ctx["timezone"] or "Europe/Rome")
+def revalidate_slots(tenant: dict, knowledge: dict, collected_data: dict,
+                     slots: list[dict]) -> list[dict]:
+    """Compatibilità: la riverifica usa la stessa logica della ricerca."""
+    service = collected_data.get("service")
+    return [slot for slot in slots if validate_exact_slot(
+        tenant, knowledge, service, slot)["status"] == "available"]
 
-    dates = [str(s["date"])[:10] for s in slots if s.get("date")]
-
-    if not dates:
-        return []
-
-    busy_events = appointment_repo.list_busy_for_availability(
-        tenant_id=ctx["tenant_id"],
-        date_from=min(dates),
-        date_to=max(dates),
-    )
-
-    busy = []
-
-    for event in busy_events:
-        appointment_date = event.get("appointment_date")
-        appointment_time = event.get("appointment_time")
-        duration = event.get("duration_minutes") or 30
-
-        if not appointment_date or not appointment_time:
-            continue
-
-        year, month, day = (
-            int(part)
-            for part in str(appointment_date)[:10].split("-")
-        )
-
-        hour, minute = _parse_time(appointment_time)
-
-        start = datetime(
-            year, month, day, hour, minute, tzinfo=tz
-        )
-
-        busy.append((start, start + timedelta(minutes=duration)))
-
-    def overlaps_busy(start, end):
-        return any(
-            start < busy_end and end > busy_start
-            for busy_start, busy_end in busy
-        )
-
-    duration_min = ctx["duration_minutes"]
-    buffer_before = ctx["buffer_before"]
-    buffer_after = ctx["buffer_after"]
-    lead_time = timedelta(hours=ctx["min_lead_hours"])
-    now = datetime.now(tz)
-
-    valid = []
-
-    for slot in slots:
-        try:
-            year, month, day = (
-                int(part)
-                for part in str(slot["date"])[:10].split("-")
-            )
-            hour, minute = _parse_time(slot["time"])
-        except (KeyError, ValueError, TypeError):
-            continue
-
-        visit_start = datetime(
-            year, month, day, hour, minute, tzinfo=tz
-        )
-        visit_end = visit_start + timedelta(minutes=duration_min)
-
-        block_start = visit_start - timedelta(minutes=buffer_before)
-        block_end = visit_end + timedelta(minutes=buffer_after)
-
-        if visit_start < now + lead_time:
-            continue
-
-        if overlaps_busy(block_start, block_end):
-            continue
-
-        valid.append(slot)
-
-    return valid[:MAX_CANDIDATE_SLOTS]
 
 
 def create_booking(
