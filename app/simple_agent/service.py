@@ -133,7 +133,7 @@ Se c'è UN SOLO servizio disponibile, è quello predefinito: NON chiedere al cli
 Per 'settimana prossima' riferita a OGGI usa search_slots(period='next_week'); per 'verso fine settimana prossima' usa anche week_part='end'. Se il cliente ha appena visto orari per un periodo e chiede 'la settimana dopo', 'quella successiva' o espressioni equivalenti, il riferimento è L'ULTIMA SETTIMANA CERCATA, non oggi: usa search_slots(period='following_last_search_week'). Conserva le preferenze precedenti (porzione di settimana e fascia oraria) finché il cliente non le modifica. Anche richieste successive di avanzamento vanno riferite all'ultima ricerca effettuata. Se il cliente cambia solo fascia oraria (es. «di pomeriggio?»), usa search_slots(period='same_last_search', after_time='{AFTERNOON_START}') mantenendo i giorni della ricerca appena effettuata. Non calcolare manualmente le date relative.
 Le fasce dello studio sono: mattina prima delle {AFTERNOON_START}; pomeriggio dalle {AFTERNOON_START} fino a prima delle {EVENING_START}; sera dalle {EVENING_START} in poi. Se il cliente chiede solo una fascia, imposta after_time e before_time coerenti con questi confini: mattina before_time='{AFTERNOON_START}', pomeriggio after_time='{AFTERNOON_START}' e before_time='{EVENING_START}', sera after_time='{EVENING_START}'. I confini di after_time sono inclusivi e quelli di before_time esclusivi. Quando il cliente cambia soltanto fascia, usa same_last_search. Non proporre le 12:30 come pomeriggio.
 Non dichiarare mai 'non ci sono disponibilità' sulla base di un errore di tool; distingui errori da assenza di risultati. Quando comunichi una ricerca effettuata, nomina SEMPRE la fascia oraria effettivamente applicata dal backend, anche se non ci sono disponibilità. La fascia della ricerca successiva resta quella precedente se il cliente cambia soltanto settimana; non ometterla nelle risposte.
-Se l'utente chiede di spostare ma non dice QUANDO, domanda prima la preferenza;
+Quando il cliente vuole SPOSTARE o CANCELLARE un appuntamento, il PRIMO passo è identificare un appuntamento reale e futuro del cliente. Nelle informazioni di contesto trovi customer_appointments: è una lettura recente del database, non una deduzione. Se ne esiste UNO solo, indica la data e l'ora di quello e verifica che il cliente intenda proprio quell'appuntamento; se ce ne sono più di uno, presentali brevemente e chiedi QUALE vuole modificare. Solo DOPO che l'appuntamento è identificato chiedi quando vorrebbe spostarlo. Se non ci sono appuntamenti nell'elenco e has_more=false, comunica che non risultano appuntamenti futuri confermati da spostare, senza chiedere una nuova data. Se l'elenco è parziale (has_more=true) o il cliente nomina un appuntamento non mostrato, usa list_appointments con filtri o paginazione. Se customer_appointments.status è lookup_error, non affermare che il cliente non abbia appuntamenti: spiega che al momento non riesci a verificarli. Non cercare slot alternativi finché non hai identificato la prenotazione da spostare.
 NON immaginare un giorno o un orario. Chiedi una sola informazione utile per volta.
 Usa esclusivamente strumenti per conoscere appuntamenti, servizi e disponibilità.
 Non affermare mai che una modifica sia eseguita finché il backend non ne dà esito.
@@ -642,13 +642,23 @@ def respond(state, message, button_id, tenant, customer, knowledge, client=None)
         from openai import OpenAI
         client = OpenAI(api_key=Config.OPENAI_API_KEY, timeout=20)
     _search_anchor(state) if (state.get("last_slots") and not _valid_search_window(state.get("last_search_window"))) else None
+    # Lettura preventiva, indipendente dal linguaggio del cliente: l'AI non può
+    # saltare arbitrariamente la verifica degli appuntamenti prima di chiedere
+    # quando spostarli. La ricerca mirata rimane disponibile via tool.
+    try:
+        current_appointments = _appointments(tenant, customer, page=1)
+        current_appointments = {"status": "ok", **current_appointments}
+    except Exception:
+        LOG.exception("CUSTOMER_APPOINTMENTS_PREFETCH_FAILED")
+        current_appointments = {"status": "lookup_error", "appointments": [], "has_more": None}
     history = [{"role":"system","content":SYSTEM},
                {"role":"system","content":json.dumps({"today":now.date().isoformat(),
                     "timezone":str(tz),"business":tenant.get("business_name"),
                     "available_services":[sv.get("name") for sv in (knowledge.get("services") or [])],
                     "last_slots":state["last_slots"],"last_search_window":state.get("last_search_window"),"previously_shown_slots":state["seen_slots"][-40:],
                     "offered_slots":state.get("offered_slots", [])[-40:],
-                     "draft_selection":state.get("draft_selection")},
+                     "draft_selection":state.get("draft_selection"),
+                     "customer_appointments":current_appointments},
                     ensure_ascii=False)}]
     history += state["history"][-MAX_HISTORY:]
     history.append({"role":"user","content":message[:1500]})
