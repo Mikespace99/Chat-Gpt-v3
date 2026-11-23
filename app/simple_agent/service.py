@@ -164,7 +164,7 @@ I riferimenti temporali sono tre fatti DISTINTI: data dell'appuntamento selezion
 Se una frase ammette più ancore ragionevoli (ad esempio "settimana successiva" dopo aver discusso sia della data originale sia di più settimane cercate), NON chiamare search_slots né propose_operation: usa time_reference_options e chiedi QUALE settimana intende, mostrando lunedì e domenica con i giorni della settimana. Una domanda breve basta. Non inventare mai un'ancora. "Primo disponibile" conserva la fascia già espressa finché il cliente non chiede di cambiarla; cerca e proponi uno slot, ma non spostare senza conferma.
 Quando il cliente identifica l’appuntamento da modificare, chiama select_appointment con l’ID reale: la selezione resta nello stato. Risolvi i riferimenti temporali usando un’ancora esplicita: per una richiesta relativa alla data dell’appuntamento selezionato, usa search_slots(period="selected_appointment_day", day_offset=numero_di_giorni) con i filtri desiderati; per una modifica della fascia sull’ultima ricerca usa same_last_search; per la settimana successiva a quella cercata usa following_last_search_week. Le date relative a oggi usano this_week o next_week. Python calcola tutte le date. Quando il cliente cambia solo il periodo, mantieni le preferenze di fascia non revocate. Non espandere un giorno singolo in una settimana.
 Se esiste un appuntamento selezionato e il cliente indica una nuova fascia oraria senza nominare un altro giorno, il riferimento implicito è il giorno di quell’appuntamento: usa search_slots(period="selected_appointment_day", day_offset=0). Non chiedere nuovamente data o fascia già conosciute.
-Le fasce dello studio sono: mattina prima delle {AFTERNOON_START}; pomeriggio dalle {AFTERNOON_START} fino a prima delle {EVENING_START}; sera dalle {EVENING_START} in poi. Se il cliente chiede solo una fascia, imposta after_time e before_time coerenti con questi confini: mattina before_time='{AFTERNOON_START}', pomeriggio after_time='{AFTERNOON_START}' e before_time='{EVENING_START}', sera after_time='{EVENING_START}'. I confini di after_time sono inclusivi e quelli di before_time esclusivi. Quando il cliente cambia soltanto fascia, usa same_last_search. Non proporre le 12:30 come pomeriggio.
+Le fasce dello studio sono: mattina prima delle {AFTERNOON_START}; pomeriggio dalle {AFTERNOON_START} fino a prima delle {EVENING_START}; sera dalle {EVENING_START} in poi. Se il cliente chiede solo una fascia, imposta after_time e before_time coerenti con questi confini: mattina before_time='{AFTERNOON_START}', pomeriggio after_time='{AFTERNOON_START}' e before_time='{EVENING_START}', sera after_time='{EVENING_START}'. I confini di after_time sono inclusivi e quelli di before_time esclusivi. Quando il cliente cambia soltanto fascia, usa selected_appointment_day se è stato selezionato un appuntamento; usa same_last_search SOLO per una ricerca generica senza appuntamento selezionato. Non proporre le 12:30 come pomeriggio.
 Non dichiarare mai 'non ci sono disponibilità' sulla base di un errore di tool; distingui errori da assenza di risultati. Quando comunichi una ricerca effettuata, nomina SEMPRE la fascia oraria effettivamente applicata dal backend, anche se non ci sono disponibilità. La fascia della ricerca successiva resta quella precedente se il cliente cambia soltanto settimana; non ometterla nelle risposte.
 Quando il cliente vuole SPOSTARE o CANCELLARE un appuntamento, il PRIMO passo è identificare un appuntamento reale e futuro del cliente. Nelle informazioni di contesto trovi customer_appointments: è una lettura recente del database, non una deduzione. Se ne esiste UNO solo, indica la data e l'ora di quello e verifica che il cliente intenda proprio quell'appuntamento; se ce ne sono più di uno, presentali brevemente e chiedi QUALE vuole modificare. Solo DOPO che l'appuntamento è identificato chiedi quando vorrebbe spostarlo. Se non ci sono appuntamenti nell'elenco e has_more=false, comunica che non risultano appuntamenti futuri confermati da spostare, senza chiedere una nuova data. Se l'elenco è parziale (has_more=true) o il cliente nomina un appuntamento non mostrato, usa list_appointments con filtri o paginazione. Se customer_appointments.status è lookup_error, non affermare che il cliente non abbia appuntamenti: spiega che al momento non riesci a verificarli. Non cercare slot alternativi finché non hai identificato la prenotazione da spostare.
 NON immaginare un giorno o un orario. Chiedi una sola informazione utile per volta.
@@ -444,6 +444,14 @@ def _execute_tool(name, payload, state, tenant, customer, knowledge, now):
         own = _owned_appointment(tenant, customer, payload["appointment_id"])
         if not own:
             return {"status":"not_found", "message":"Appuntamento non trovato per il cliente"}
+        prior_selected_id = (state.get("selected_appointment") or {}).get("id")
+        if prior_selected_id != str(own["id"]):
+            # The prior appointment's search is not a valid date anchor for
+            # another appointment. Reset only appointment-specific search state.
+            state["last_search_window"] = None
+            state["last_slots"] = []
+            state["seen_slots"] = []
+        state["presented_appointment_ids"] = []
         state["selected_appointment"] = {
             "id": str(own["id"]),
             "date": str(own["appointment_date"]),
@@ -741,6 +749,68 @@ def _confirm(state, button_id, tenant, customer, now, knowledge=None):
         return "Non posso ancora verificare l’esito. Non invii una nuova richiesta: risponda «confermo» per ritentare la verifica della stessa operazione.", p
 
 
+def _appointment_list_choice(message, displayed_ids):
+    """Resolve a numbered-list reference, never an inferred appointment date.
+
+    The displayed list is a backend-generated, ordered set of IDs. If a
+    reference is not unambiguous, leave the interpretation to the agent.
+    """
+    if not displayed_ids:
+        return None
+    words = {
+        "primo": 1, "prima": 1, "secondo": 2, "seconda": 2,
+        "terzo": 3, "terza": 3, "quarto": 4, "quarta": 4,
+        "quinto": 5, "quinta": 5, "sesto": 6, "sesta": 6,
+        "settimo": 7, "settima": 7, "ottavo": 8, "ottava": 8,
+        "nono": 9, "nona": 9, "decimo": 10, "decima": 10,
+    }
+    normalized = re.sub(r"[^\w\s]", " ", message.casefold()).strip()
+    # A reference is valid only in the context of a presented appointment
+    # list and only when the message is a choice, not a new time preference.
+    match = re.fullmatch(
+        r"(?:(?:vorrei|voglio|spostare|sposta|scegli|scelgo|quello|quella) |"
+        r"l |il |la |appuntamento |della |dello |dalla |dal |lista |numero |n |\s)+"
+        r"(\d{1,2}|" + "|".join(words) + r")"
+        r"(?:\s+(?:della|dello|dalla|dal|lista|elenco|appuntamento|numero|n))*",
+        normalized,
+    )
+    if not match:
+        return None
+    token = match.group(1)
+    position = int(token) if token.isdigit() else words[token]
+    return displayed_ids[position - 1] if 1 <= position <= len(displayed_ids) else None
+
+
+def _displayed_appointments_from_reply(reply, rows):
+    """Bind a numbered appointment list to the exact rows actually shown.
+
+    Parse the date/time rendered to the customer, rather than assuming the
+    model always lists rows in database order. Ambiguous lists are ignored.
+    """
+    if not reply or not rows:
+        return []
+    months = {name: i + 1 for i, name in enumerate(_MONTHS)}
+    lines = re.findall(
+        r"(?m)^\s*\*?(\d{1,2})[.)]\*?\s+([^\n]+)", reply)
+    if not lines:
+        return []
+    mapped = []
+    for expected, (number, line) in enumerate(lines, 1):
+        if int(number) != expected:
+            return []
+        date_match = re.search(r"(\d{1,2})\s+(" + "|".join(months) + r")\s+(20\d{2})", line.casefold())
+        time_match = re.search(r"\b([01]?\d|2[0-3]):([0-5]\d)\b", line)
+        if not date_match or not time_match:
+            return []
+        d = f"{int(date_match.group(3)):04d}-{months[date_match.group(2)]:02d}-{int(date_match.group(1)):02d}"
+        t = f"{int(time_match.group(1)):02d}:{time_match.group(2)}"
+        matching = [r for r in rows if str(r.get('appointment_date')) == d and str(r.get('appointment_time'))[:5] == t]
+        if len(matching) != 1 or str(matching[0]['id']) in mapped:
+            return []
+        mapped.append(str(matching[0]['id']))
+    return mapped
+
+
 def respond(state, message, button_id, tenant, customer, knowledge, client=None):
     """Return (state, reply, optional buttons); supports free-text confirmations."""
     tz = ZoneInfo(tenant.get("timezone") or "Europe/Rome")
@@ -779,6 +849,31 @@ def respond(state, message, button_id, tenant, customer, knowledge, client=None)
         # The customer changed the request: invalidate the old proposal,
         # then let the same agent understand the new preference in context.
         state["pending"] = None
+    # A previously displayed numbered list is an explicit customer-facing
+    # reference. Resolve it deterministically and update the authoritative
+    # selected appointment BEFORE asking the model to continue the conversation.
+    listed_ids = list(state.get("presented_appointment_ids") or [])
+    selected_id = _appointment_list_choice(message, listed_ids)
+    if selected_id is not None:
+        try:
+            selection = _execute_tool("select_appointment", {"appointment_id": selected_id},
+                                      state, tenant, customer, knowledge, now)
+            if selection.get("status") == "selected":
+                state["last_search_window"] = None
+                state["last_slots"] = []
+                state["seen_slots"] = []
+                state["presented_appointment_ids"] = []
+                found = selection["appointment"]
+                reply = (f"Hai selezionato l'appuntamento di {_human_date(found['date'])} "
+                         f"alle {found['time']}. Quando preferisci spostarlo?")
+                _remember(state, message, reply)
+                return state, reply, None
+            LOG.warning("APPOINTMENT_SELECTION_FAILED status=%s", selection.get("status"))
+        except Exception:
+            LOG.exception("APPOINTMENT_SELECTION_TECHNICAL_ERROR")
+            reply = "Non riesco a verificare l'appuntamento scelto in questo momento. Riprova tra poco."
+            _remember(state, message, reply)
+            return state, reply, None
     if client is None:
         from openai import OpenAI
         client = OpenAI(api_key=Config.OPENAI_API_KEY, timeout=20)
@@ -894,5 +989,14 @@ def respond(state, message, button_id, tenant, customer, knowledge, client=None)
                 # l'elenco degli slot validi già comunicato dall'AI.
                 if fascia not in text.casefold():
                     text = _search_report(latest_search) + " " + text
+    # Only an actually rendered, unambiguous numbered list can become an
+    # ordinal-selection reference. Never reuse an older list indefinitely.
+    shown = _displayed_appointments_from_reply(
+        text, current_appointments.get("appointments", [])
+        if current_appointments.get("status") == "ok" else [])
+    if shown:
+        state["presented_appointment_ids"] = shown
+        # An old selection must not silently survive a new selection list.
+        state["selected_appointment"] = None
     _remember(state, message, text)
     return state,text,buttons
