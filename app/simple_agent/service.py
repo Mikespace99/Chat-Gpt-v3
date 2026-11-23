@@ -22,7 +22,7 @@ from app.operations.idempotency import operation_scope
 from app.repositories import appointment as appointments
 
 LOG = logging.getLogger(__name__)
-MAX_CALLS = 4
+MAX_CALLS = 10  # Budget complessivo per turno: non interrompere senza una risposta finale
 MAX_HISTORY = 12  # six complete exchanges, if alternating
 # Optional WhatsApp buttons: disabled by default; text always works.
 SHOW_CONFIRM_BUTTONS = os.getenv("WHATSAPP_CONFIRM_BUTTONS", "false").lower() in ("1", "true", "yes", "on")
@@ -163,6 +163,7 @@ Se c'è UN SOLO servizio disponibile, è quello predefinito: NON chiedere al cli
 I riferimenti temporali sono tre fatti DISTINTI: data dell'appuntamento selezionato, ultima finestra effettivamente cercata e preferenze attive. Per search_slots preferisci reference + week_offset (es. last_search, 1); per "la settimana del 7 dicembre" usa reference="explicit" e date_from/date_to esatte: una correzione esplicita del cliente ha priorità sulle ancore precedenti. NON continuare a incrementare la settimana quando viene fornita una data esplicita.
 Se una frase ammette più ancore ragionevoli (ad esempio "settimana successiva" dopo aver discusso sia della data originale sia di più settimane cercate), NON chiamare search_slots né propose_operation: usa time_reference_options e chiedi QUALE settimana intende, mostrando lunedì e domenica con i giorni della settimana. Una domanda breve basta. Non inventare mai un'ancora. "Primo disponibile" conserva la fascia già espressa finché il cliente non chiede di cambiarla; cerca e proponi uno slot, ma non spostare senza conferma.
 Quando il cliente identifica l’appuntamento da modificare, chiama select_appointment con l’ID reale: la selezione resta nello stato. Risolvi i riferimenti temporali usando un’ancora esplicita: per una richiesta relativa alla data dell’appuntamento selezionato, usa search_slots(period="selected_appointment_day", day_offset=numero_di_giorni) con i filtri desiderati; per una modifica della fascia sull’ultima ricerca usa same_last_search; per la settimana successiva a quella cercata usa following_last_search_week. Le date relative a oggi usano this_week o next_week. Python calcola tutte le date. Quando il cliente cambia solo il periodo, mantieni le preferenze di fascia non revocate. Non espandere un giorno singolo in una settimana.
+Se esiste un appuntamento selezionato e il cliente indica una nuova fascia oraria senza nominare un altro giorno, il riferimento implicito è il giorno di quell’appuntamento: usa search_slots(period="selected_appointment_day", day_offset=0). Non chiedere nuovamente data o fascia già conosciute.
 Le fasce dello studio sono: mattina prima delle {AFTERNOON_START}; pomeriggio dalle {AFTERNOON_START} fino a prima delle {EVENING_START}; sera dalle {EVENING_START} in poi. Se il cliente chiede solo una fascia, imposta after_time e before_time coerenti con questi confini: mattina before_time='{AFTERNOON_START}', pomeriggio after_time='{AFTERNOON_START}' e before_time='{EVENING_START}', sera after_time='{EVENING_START}'. I confini di after_time sono inclusivi e quelli di before_time esclusivi. Quando il cliente cambia soltanto fascia, usa same_last_search. Non proporre le 12:30 come pomeriggio.
 Non dichiarare mai 'non ci sono disponibilità' sulla base di un errore di tool; distingui errori da assenza di risultati. Quando comunichi una ricerca effettuata, nomina SEMPRE la fascia oraria effettivamente applicata dal backend, anche se non ci sono disponibilità. La fascia della ricerca successiva resta quella precedente se il cliente cambia soltanto settimana; non ometterla nelle risposte.
 Quando il cliente vuole SPOSTARE o CANCELLARE un appuntamento, il PRIMO passo è identificare un appuntamento reale e futuro del cliente. Nelle informazioni di contesto trovi customer_appointments: è una lettura recente del database, non una deduzione. Se ne esiste UNO solo, indica la data e l'ora di quello e verifica che il cliente intenda proprio quell'appuntamento; se ce ne sono più di uno, presentali brevemente e chiedi QUALE vuole modificare. Solo DOPO che l'appuntamento è identificato chiedi quando vorrebbe spostarlo. Se non ci sono appuntamenti nell'elenco e has_more=false, comunica che non risultano appuntamenti futuri confermati da spostare, senza chiedere una nuova data. Se l'elenco è parziale (has_more=true) o il cliente nomina un appuntamento non mostrato, usa list_appointments con filtri o paginazione. Se customer_appointments.status è lookup_error, non affermare che il cliente non abbia appuntamenti: spiega che al momento non riesci a verificarli. Non cercare slot alternativi finché non hai identificato la prenotazione da spostare.
@@ -803,40 +804,69 @@ def respond(state, message, button_id, tenant, customer, knowledge, client=None)
                     ensure_ascii=False)}]
     history += state["history"][-MAX_HISTORY:]
     history.append({"role":"user","content":message[:1500]})
-    text = "Mi dica quale giorno o fascia oraria preferisce, così posso verificare le disponibilità."
+    text = None
     used = 0
     latest_search = None
     clarification = None
-    for _ in range(MAX_CALLS + 1):
-        answer = client.chat.completions.create(model=Config.AI_MODEL_INTENT,
-                 messages=history, tools=TOOLS, tool_choice="auto", temperature=0)
+    tool_errors = []
+    # L'AI deve poter leggere gli esiti dei tool e formulare la risposta.
+    # Esaurire il budget non deve mai produrre una finta richiesta di preferenze.
+    for _ in range(MAX_CALLS + 2):
+        remaining = MAX_CALLS - used
+        request = {"model": Config.AI_MODEL_INTENT, "messages": history, "temperature": 0}
+        if remaining > 0:
+            request.update({"tools": TOOLS, "tool_choice": "auto"})
+        # Senza strumenti dopo il limite, il modello può spiegare il risultato
+        # dei controlli fatti; non chiedere automaticamente le preferenze.
+        answer = client.chat.completions.create(**request)
         msg = answer.choices[0].message
         calls = getattr(msg, "tool_calls", None) or []
         if not calls:
-            text = (getattr(msg,"content",None) or text).strip()[:1800]
+            text = (getattr(msg, "content", None) or "").strip()[:1800] or None
+            if text is None:
+                LOG.error("AGENT_EMPTY_RESPONSE used=%s selected=%s", used,
+                          bool(state.get("selected_appointment")))
             break
         history.append(msg.model_dump(exclude_none=True))
         for call in calls:
-            used += 1
-            if used > MAX_CALLS:
-                output = {"error":"Limite chiamate strumenti raggiunto"}
+            if used >= MAX_CALLS:
+                output = {"status": "tool_limit", "message": "Limite di interrogazioni raggiunto"}
             else:
+                used += 1
                 try:
                     data = json.loads(call.function.arguments or "{}")
-                    if not isinstance(data,dict): raise ValueError("Parametri invalidi")
-                    output = _execute_tool(call.function.name, data, state, tenant,customer,knowledge,now)
+                    if not isinstance(data, dict):
+                        raise ValueError("Parametri non validi")
+                    output = _execute_tool(call.function.name, data, state,
+                                           tenant, customer, knowledge, now)
                     if call.function.name == "time_reference_options" and output.get("status") == "clarification_options":
                         clarification = output
                     if call.function.name == "search_slots" and output.get("status") in ("ok", "not_found_in_requested_window"):
                         latest_search = output
-                except (ValueError, ValidationError,TypeError,KeyError) as exc:
-                    output = {"error":str(exc)[:200]}
-            history.append({"role":"tool","tool_call_id":call.id,
-                            "content":json.dumps(output,ensure_ascii=False,default=str)})
-            if state.get("pending") or clarification is not None:
-                break
-        if state.get("pending") or clarification is not None or used >= MAX_CALLS:
+                    LOG.info("AGENT_TOOL name=%s status=%s used=%s", call.function.name,
+                             output.get("status", "ok"), used)
+                except (ValueError, ValidationError, TypeError, KeyError) as exc:
+                    LOG.warning("AGENT_TOOL_VALIDATION_ERROR tool=%s issue=%s", call.function.name, exc)
+                    output = {"status": "tool_error", "message": str(exc)[:200]}
+                    tool_errors.append(call.function.name)
+                except Exception:
+                    LOG.exception("AGENT_TOOL_EXECUTION_ERROR tool=%s", call.function.name)
+                    output = {"status": "technical_error", "message": "Strumento temporaneamente non disponibile"}
+                    tool_errors.append(call.function.name)
+            history.append({"role": "tool", "tool_call_id": call.id,
+                            "content": json.dumps(output, ensure_ascii=False, default=str)})
+        # Completare sempre tutti gli output dei tool prima di uscire; altrimenti
+        # il modello non riceve i risultati e la risposta cade sul fallback.
+        if state.get("pending") or clarification is not None:
             break
+    else:
+        LOG.error("AGENT_MAX_ROUNDS_REACHED used=%s", used)
+
+    if text is None:
+        if tool_errors:
+            text = "Non riesco a completare la verifica per un problema tecnico. Nessuna modifica è stata effettuata."
+        else:
+            text = "Non sono riuscito a completare la verifica della disponibilità. Nessuna modifica è stata effettuata; puoi riprovare?"
     if clarification is not None:
         options = clarification["options"]
         if len(options) >= 2:
