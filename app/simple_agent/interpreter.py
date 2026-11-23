@@ -119,12 +119,44 @@ def _strict_schema() -> dict:
             for value in node:
                 simplify(value)
     simplify(schema)
+    # In the wire protocol null means "not specified" for identity/default
+    # fields; the application converts it to the unique safe default above.
+    for name in ('date_action', 'time_action', 'offset_days', 'offset_weeks',
+                 'decision', 'ambiguous'):
+        prop = schema.get('properties', {}).get(name)
+        if isinstance(prop, dict) and prop.get('type') in ('string', 'integer', 'boolean'):
+            prop['type'] = [prop['type'], 'null']
+    allowed = {
+        'operation': ['create', 'reschedule', 'cancel', 'info', None],
+        'change_scope': ['date', 'time', 'both', None],
+        'date_action': ['keep', 'set', 'clear', None],
+        'time_action': ['keep', 'set', 'clear', None],
+        'date_reference': ['selected_day', 'selected_week', 'last_search_week', 'today_week', 'explicit', None],
+        'time_band': ['morning', 'afternoon', 'evening', 'any', None],
+        'selection': ['first', 'options', None],
+        'decision': ['none', 'confirm', 'reject', 'change', None],
+    }
+    for name, choices in allowed.items():
+        schema['properties'][name]['enum'] = choices
     return {'type': 'json_schema', 'json_schema': {
         'name': 'appointment_meaning', 'strict': True, 'schema': schema}}
 
 
 RESPONSE_FORMAT = _strict_schema()
 KNOWN_FIELDS = frozenset(Meaning.model_fields)
+# These fields have a meaningful, safe identity/default when omitted.
+# Some models produce JSON null for an "unmodified" field even with a
+# structured response format. Normalize only these specific nulls, never
+# invent values for requested dates, IDs or preferences.
+SAFE_NULL_DEFAULTS = {
+    'date_action': 'keep',
+    'time_action': 'keep',
+    'offset_days': 0,
+    'offset_weeks': 0,
+    'decision': 'none',
+    'ambiguous': False,
+}
+
 
 
 def _validate_content(raw: str) -> Meaning:
@@ -143,10 +175,21 @@ def _validate_content(raw: str) -> Meaning:
     supported = {key: value for key, value in payload.items() if key in KNOWN_FIELDS}
     if not supported:
         raise InterpretationError('no_known_fields')
+    for field, default in SAFE_NULL_DEFAULTS.items():
+        if supported.get(field, default) is None:
+            supported[field] = default
     try:
         return Meaning.model_validate(supported)
     except ValidationError as exc:
-        LOG.warning('GUIDED_INTERPRETER_SCHEMA_MISMATCH issues=%s', exc.error_count())
+        # Log only schema field paths and error kinds, never customer messages,
+        # names or model payloads. This makes a repeat failure diagnosable.
+        issues = [
+            {'field': '.'.join(map(str, err.get('loc', ()))),
+             'type': err.get('type', 'unknown')}
+            for err in exc.errors(include_input=False, include_context=False)
+        ]
+        LOG.warning('GUIDED_INTERPRETER_SCHEMA_MISMATCH issues=%s details=%s',
+                    len(issues), issues)
         raise InterpretationError('invalid_fields') from exc
 
 
