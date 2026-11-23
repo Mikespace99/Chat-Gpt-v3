@@ -36,6 +36,7 @@ class SearchArgs(BaseModel):
     date_from: Date | None = None
     date_to: Date | None = None
     period: str | None = None
+    day_offset: int = Field(default=0, ge=-30, le=30)
     week_part: str | None = None
     after_time: str | None = None
     before_time: str | None = None
@@ -44,10 +45,12 @@ class SearchArgs(BaseModel):
 
     @model_validator(mode="after")
     def check(self):
-        if self.period not in (None, "this_week", "next_week", "following_last_search_week", "same_last_search"):
+        if self.period not in (None, "this_week", "next_week", "following_last_search_week", "same_last_search", "selected_appointment_day"):
             raise ValueError("Periodo non valido")
         if self.week_part not in (None, "start", "middle", "end"):
             raise ValueError("Porzione della settimana non valida")
+        if self.day_offset and self.period != "selected_appointment_day":
+            raise ValueError("day_offset richiede il riferimento a un appuntamento selezionato")
         if self.period and (self.date_from or self.date_to):
             raise ValueError("Specificare periodo O date esplicite, non entrambi")
         if not self.period and (not self.date_from or not self.date_to):
@@ -106,6 +109,11 @@ TOOLS = [
           "service":{"type":"string"},
           "page":{"type":"integer","minimum":1}},
           "additionalProperties":False}}},
+    {"type":"function", "function":{"name":"select_appointment",
+      "description":"Registra quale appuntamento FUTURO confermato il cliente ha scelto di spostare/cancellare. Usa l'ID reale restituito dall'elenco; verifica direttamente Supabase e salva la selezione nel contesto. Chiama questo tool PRIMA di chiedere la nuova data o di cercare disponibilità.",
+      "parameters":{"type":"object","properties":{
+          "appointment_id":{"type":"string","description":"ID dell'appuntamento del cliente, non una data"}},
+          "required":["appointment_id"],"additionalProperties":False}}},
     {"type":"function", "function":{"name":"business_info",
       "description":"Leggi servizi, durata, orari e informazioni pubbliche dello studio.",
       "parameters":{"type":"object","properties":{},"additionalProperties":False}}},
@@ -113,7 +121,8 @@ TOOLS = [
       "description":"Cerca orari REALI, dopo che il cliente ha indicato almeno una preferenza temporale. Per 'altri orari' escludi i già proposti.",
       "parameters":{"type":"object","properties":{
         "date_from":{"type":"string","description":"YYYY-MM-DD; usare SOLO per date esplicite"},"date_to":{"type":"string","description":"YYYY-MM-DD; usare SOLO per date esplicite"},
-        "period":{"type":"string","enum":["this_week","next_week","following_last_search_week","same_last_search"],"description":"this_week/next_week sono rispetto a OGGI; following_last_search_week è la settimana DOPO l’ultima settimana effettivamente cercata. same_last_search ripete il periodo appena cercato con filtri diversi (es. «di pomeriggio?»). Questi riferimenti richiedono la memoria della ricerca precedente. Non calcolare date a mano"},
+        "period":{"type":"string","enum":["this_week","next_week","following_last_search_week","same_last_search","selected_appointment_day"],"description":"Riferimento temporale: selected_appointment_day usa la data dell’appuntamento selezionato e verificato da Python; same_last_search ripete l’intervallo cercato; following_last_search_week avanza di una settimana rispetto all’ultimo intervallo; this_week e next_week sono riferiti a oggi. Non inventare date."},
+        "day_offset":{"type":"integer","minimum":-30,"maximum":30,"description":"Solo con selected_appointment_day: giorni di distanza dalla data dell’appuntamento selezionato (0 stesso giorno, 1 giorno dopo, -1 giorno prima)."},
         "week_part":{"type":"string","enum":["start","middle","end"],"description":"Per 'verso fine settimana' usa end"},
         "after_time":{"type":"string"},"before_time":{"type":"string"},"service":{"type":"string"},
         "exclude_previous":{"type":"boolean"}},"required":[],"additionalProperties":False}}},
@@ -130,7 +139,7 @@ SYSTEM = f"""Sei l'unico assistente WhatsApp per prenotare, spostare e cancellar
 Conversa in italiano in modo breve e chiaro. Comprendi liberamente varianti linguistiche e
 preferenze, senza inventare dati o orari. Oggi e il fuso sono nel contesto.
 Se c'è UN SOLO servizio disponibile, è quello predefinito: NON chiedere al cliente quale servizio vuole. 'Appuntamento' è una richiesta generica e non il nome di un servizio.
-Per 'settimana prossima' riferita a OGGI usa search_slots(period='next_week'); per 'verso fine settimana prossima' usa anche week_part='end'. Se il cliente ha appena visto orari per un periodo e chiede 'la settimana dopo', 'quella successiva' o espressioni equivalenti, il riferimento è L'ULTIMA SETTIMANA CERCATA, non oggi: usa search_slots(period='following_last_search_week'). Conserva le preferenze precedenti (porzione di settimana e fascia oraria) finché il cliente non le modifica. Anche richieste successive di avanzamento vanno riferite all'ultima ricerca effettuata. Se il cliente cambia solo fascia oraria (es. «di pomeriggio?»), usa search_slots(period='same_last_search', after_time='{AFTERNOON_START}') mantenendo i giorni della ricerca appena effettuata. Non calcolare manualmente le date relative.
+Quando il cliente identifica l’appuntamento da modificare, chiama select_appointment con l’ID reale: la selezione resta nello stato. Risolvi i riferimenti temporali usando un’ancora esplicita: per una richiesta relativa alla data dell’appuntamento selezionato, usa search_slots(period="selected_appointment_day", day_offset=numero_di_giorni) con i filtri desiderati; per una modifica della fascia sull’ultima ricerca usa same_last_search; per la settimana successiva a quella cercata usa following_last_search_week. Le date relative a oggi usano this_week o next_week. Python calcola tutte le date. Quando il cliente cambia solo il periodo, mantieni le preferenze di fascia non revocate. Non espandere un giorno singolo in una settimana.
 Le fasce dello studio sono: mattina prima delle {AFTERNOON_START}; pomeriggio dalle {AFTERNOON_START} fino a prima delle {EVENING_START}; sera dalle {EVENING_START} in poi. Se il cliente chiede solo una fascia, imposta after_time e before_time coerenti con questi confini: mattina before_time='{AFTERNOON_START}', pomeriggio after_time='{AFTERNOON_START}' e before_time='{EVENING_START}', sera after_time='{EVENING_START}'. I confini di after_time sono inclusivi e quelli di before_time esclusivi. Quando il cliente cambia soltanto fascia, usa same_last_search. Non proporre le 12:30 come pomeriggio.
 Non dichiarare mai 'non ci sono disponibilità' sulla base di un errore di tool; distingui errori da assenza di risultati. Quando comunichi una ricerca effettuata, nomina SEMPRE la fascia oraria effettivamente applicata dal backend, anche se non ci sono disponibilità. La fascia della ricerca successiva resta quella precedente se il cliente cambia soltanto settimana; non ometterla nelle risposte.
 Quando il cliente vuole SPOSTARE o CANCELLARE un appuntamento, il PRIMO passo è identificare un appuntamento reale e futuro del cliente. Nelle informazioni di contesto trovi customer_appointments: è una lettura recente del database, non una deduzione. Se ne esiste UNO solo, indica la data e l'ora di quello e verifica che il cliente intenda proprio quell'appuntamento; se ce ne sono più di uno, presentali brevemente e chiedi QUALE vuole modificare. Solo DOPO che l'appuntamento è identificato chiedi quando vorrebbe spostarlo. Se non ci sono appuntamenti nell'elenco e has_more=false, comunica che non risultano appuntamenti futuri confermati da spostare, senza chiedere una nuova data. Se l'elenco è parziale (has_more=true) o il cliente nomina un appuntamento non mostrato, usa list_appointments con filtri o paginazione. Se customer_appointments.status è lookup_error, non affermare che il cliente non abbia appuntamenti: spiega che al momento non riesci a verificarli. Non cercare slot alternativi finché non hai identificato la prenotazione da spostare.
@@ -217,7 +226,7 @@ def new_state(raw=None):
         return state
     return {"version": "simple-agent-1", "history": [], "seen_slots": [],
             "last_slots": [], "last_search_service": None, "last_search_window": None,
-            "offered_slots": [], "pending": None}
+            "offered_slots": [], "pending": None, "selected_appointment": None}
 
 
 def _valid_search_window(window):
@@ -289,10 +298,11 @@ def _search_fascia(after_time, before_time):
 def _search_report(result):
     """Report vincolato all'ultima ricerca: nessuna fascia può essere omessa."""
     fascia = result["fascia"]
-    periodo = f"dal {result['searched_from']} al {result['searched_to']}"
+    periodo = (f"del {result['searched_from']}" if result['searched_from'] == result['searched_to']
+               else f"dal {result['searched_from']} al {result['searched_to']}")
     if result["status"] == "not_found_in_requested_window":
         return (f"Non ho trovato appuntamenti disponibili {fascia} {periodo}. "
-                "Vuoi provare un'altra settimana o cambiare fascia oraria?")
+                "Vuoi provare un altro giorno o cambiare fascia oraria?")
     return f"Ricerca effettuata {fascia} {periodo}."
 
 
@@ -331,6 +341,18 @@ def _owned_appointment(tenant, customer, appointment_id):
 
 
 def _execute_tool(name, payload, state, tenant, customer, knowledge, now):
+    if name == "select_appointment":
+        if set(payload) != {"appointment_id"} or not isinstance(payload["appointment_id"], str):
+            raise ValueError("Occorre l'ID dell'appuntamento selezionato")
+        own = _owned_appointment(tenant, customer, payload["appointment_id"])
+        if not own:
+            return {"status":"not_found", "message":"Appuntamento non trovato per il cliente"}
+        state["selected_appointment"] = {
+            "id": str(own["id"]),
+            "date": str(own["appointment_date"]),
+            "time": str(own["appointment_time"])[:5],
+            "service": own.get("service")}
+        return {"status":"selected", "appointment":state["selected_appointment"]}
     if name == "list_appointments":
         args = AppointmentLookupArgs.model_validate(payload)
         return _appointments(tenant, customer,
@@ -355,7 +377,24 @@ def _execute_tool(name, payload, state, tenant, customer, knowledge, now):
                 inherited["before_time"] = prior["before_time"]
             if inherited:
                 args = args.model_copy(update=inherited)
-        date_from, date_to = _resolved_window(args, now.date(), state.get("last_search_window"))
+        if args.period == "selected_appointment_day":
+            selected = state.get("selected_appointment") or {}
+            appointment_id = selected.get("id")
+            if not appointment_id:
+                return {"status":"needs_appointment_selection",
+                        "message":"Prima selezionare l'appuntamento da spostare"}
+            # La data proviene nuovamente dal DB, non dalla memoria o dalla supposizione LLM.
+            current = _owned_appointment(tenant, customer, appointment_id)
+            if not current:
+                state["selected_appointment"] = None
+                return {"status":"appointment_not_found",
+                        "message":"L'appuntamento selezionato non è più modificabile"}
+            target_date = Date.fromisoformat(str(current["appointment_date"]))
+            date_from = date_to = target_date + timedelta(days=args.day_offset)
+            # Nessun filtro di porzione settimanale per un solo giorno.
+            args = args.model_copy(update={"week_part": None})
+        else:
+            date_from, date_to = _resolved_window(args, now.date(), state.get("last_search_window"))
         if date_from < now.date() or date_to > now.date() + timedelta(days=90):
             raise ValueError("Date passate o fuori orizzonte")
         services = knowledge.get("services") or []
@@ -658,6 +697,7 @@ def respond(state, message, button_id, tenant, customer, knowledge, client=None)
                     "last_slots":state["last_slots"],"last_search_window":state.get("last_search_window"),"previously_shown_slots":state["seen_slots"][-40:],
                     "offered_slots":state.get("offered_slots", [])[-40:],
                      "draft_selection":state.get("draft_selection"),
+                     "selected_appointment":state.get("selected_appointment"),
                      "customer_appointments":current_appointments},
                     ensure_ascii=False)}]
     history += state["history"][-MAX_HISTORY:]
