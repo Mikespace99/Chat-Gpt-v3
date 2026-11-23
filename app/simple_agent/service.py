@@ -16,7 +16,7 @@ from app.booking import engine
 from app.operations.idempotency import operation_scope
 from app.repositories import appointment as repo
 from app.simple_agent.state import new_state, remember, reset_operation
-from app.simple_agent.interpreter import Meaning, interpret
+from app.simple_agent.interpreter import Meaning, interpret, InterpretationError
 
 LOG = logging.getLogger(__name__)
 BUTTONS = os.getenv('WHATSAPP_CONFIRM_BUTTONS', 'false').lower() in ('1','true','yes')
@@ -472,10 +472,24 @@ def respond(state, message, button_id, tenant, customer, knowledge, client=None)
         remember(state,message,reply)
         return state,reply,None
     try:
-        m=interpret(message,state,presented,now,client=client)
-        reply=_handle(state,m,tenant,customer,knowledge,now,fetched)
+        m = interpret(message, state, presented, now, client=client)
+    except InterpretationError as exc:
+        LOG.warning('GUIDED_INTERPRETATION_UNAVAILABLE reason=%s', str(exc))
+        # The current card is unchanged. Do not claim that the calendar was checked.
+        reply = ('Non sono riuscito a interpretare il messaggio. '
+                 'Puoi riformulare la richiesta? Non ho modificato alcun appuntamento.')
+        remember(state, message, reply)
+        return state, reply, _buttons(state)
     except Exception:
-        LOG.exception('GUIDED_INTERPRET_OR_CONTROLLER_ERROR')
-        reply='Non riesco a completare questa verifica in sicurezza. Nessuna modifica è stata eseguita.'
+        LOG.exception('GUIDED_INTERPRETER_TECHNICAL_ERROR')
+        reply = 'La lettura del messaggio non è riuscita. Puoi riprovare? Nessuna modifica effettuata.'
+        remember(state, message, reply)
+        return state, reply, _buttons(state)
+    try:
+        reply = _handle(state, m, tenant, customer, knowledge, now, fetched)
+    except Exception:
+        LOG.exception('GUIDED_CONTROLLER_ERROR')
+        reply = ('Non riesco a completare la richiesta per un problema tecnico. '
+                 'Non confermo alcuna modifica; riprova tra poco.')
     remember(state,message,reply)
     return state,reply,_buttons(state)
