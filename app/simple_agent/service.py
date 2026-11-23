@@ -33,6 +33,26 @@ EVENING_START = f"{engine.TIME_BANDS['evening'][0]:02d}:00"
 
 class SearchArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+    @model_validator(mode="before")
+    @classmethod
+    def canonicalize_equivalent_anchors(cls, value):
+        """Remove redundant *equivalent* tool arguments, not conflicting requests.
+
+        The LLM sometimes supplies both period=selected_appointment_day and
+        reference=selected_appointment. These denote the same appointment
+        anchor when no week offset is requested. Keep the exact-day period,
+        which is resolved against the current appointment in Supabase.
+        Other combinations remain invalid and require clarification.
+        """
+        if not isinstance(value, dict):
+            return value
+        if (value.get("period") == "selected_appointment_day"
+                and value.get("reference") == "selected_appointment"
+                and not value.get("week_offset", 0)
+                and not value.get("date_from") and not value.get("date_to")):
+            return {k: v for k, v in value.items() if k != "reference"}
+        return value
     date_from: Date | None = None
     date_to: Date | None = None
     period: str | None = None
@@ -139,9 +159,9 @@ TOOLS = [
       "description":"Cerca orari REALI, dopo che il cliente ha indicato almeno una preferenza temporale. Per 'altri orari' escludi i già proposti.",
       "parameters":{"type":"object","properties":{
         "date_from":{"type":"string","description":"YYYY-MM-DD; usare SOLO per date esplicite"},"date_to":{"type":"string","description":"YYYY-MM-DD; usare SOLO per date esplicite"},
-        "period":{"type":"string","enum":["this_week","next_week","following_last_search_week","same_last_search","selected_appointment_day"],"description":"Riferimento temporale: selected_appointment_day usa la data dell’appuntamento selezionato e verificato da Python; same_last_search ripete l’intervallo cercato; following_last_search_week avanza di una settimana rispetto all’ultimo intervallo; this_week e next_week sono riferiti a oggi. Non inventare date."},
+        "period":{"type":"string","enum":["this_week","next_week","following_last_search_week","same_last_search","selected_appointment_day"],"description":"SCELTA ESCLUSIVA: usa period SENZA reference. selected_appointment_day cerca solo il giorno dell’appuntamento selezionato (es. «di pomeriggio?»); same_last_search ripete la precedente ricerca; following_last_search_week avanza una settimana; this_week/next_week rispetto a oggi. Non combinare period con reference."},
         "day_offset":{"type":"integer","minimum":-30,"maximum":30,"description":"Solo con selected_appointment_day: distanza dalla data dell'appuntamento."},
-        "reference":{"type":"string","enum":["today","last_search","selected_appointment","explicit"],"description":"Ancora esplicita: today=oggi; last_search=ultima ricerca effettiva; selected_appointment=appuntamento verificato da Python; explicit=date_from/date_to esplicite. Se non è chiara, chiedi chiarimento."},
+        "reference":{"type":"string","enum":["today","last_search","selected_appointment","explicit"],"description":"ALTERNATIVA a period, mai insieme: ancora per ricerche settimanali con week_offset; today=oggi, last_search=ultima ricerca, selected_appointment=la settimana dell’appuntamento, explicit=date_from/date_to. Per il SOLO giorno scelto usa period=selected_appointment_day SENZA reference."},
         "week_offset":{"type":"integer","minimum":-12,"maximum":12,"description":"Settimane relative all'ancora: 0=stessa settimana, 1=la successiva, -1=precedente. Vale solo con reference."},
         "keep_time_preferences":{"type":"boolean","description":"Di default conserva la fascia precedente quando cambia solo il periodo. false se il cliente la revoca."},
         "week_part":{"type":"string","enum":["start","middle","end"],"description":"Per 'verso fine settimana' usa end"},
@@ -162,8 +182,8 @@ preferenze, senza inventare dati o orari. Oggi e il fuso sono nel contesto.
 Se c'è UN SOLO servizio disponibile, è quello predefinito: NON chiedere al cliente quale servizio vuole. 'Appuntamento' è una richiesta generica e non il nome di un servizio.
 I riferimenti temporali sono tre fatti DISTINTI: data dell'appuntamento selezionato, ultima finestra effettivamente cercata e preferenze attive. Per search_slots preferisci reference + week_offset (es. last_search, 1); per "la settimana del 7 dicembre" usa reference="explicit" e date_from/date_to esatte: una correzione esplicita del cliente ha priorità sulle ancore precedenti. NON continuare a incrementare la settimana quando viene fornita una data esplicita.
 Se una frase ammette più ancore ragionevoli (ad esempio "settimana successiva" dopo aver discusso sia della data originale sia di più settimane cercate), NON chiamare search_slots né propose_operation: usa time_reference_options e chiedi QUALE settimana intende, mostrando lunedì e domenica con i giorni della settimana. Una domanda breve basta. Non inventare mai un'ancora. "Primo disponibile" conserva la fascia già espressa finché il cliente non chiede di cambiarla; cerca e proponi uno slot, ma non spostare senza conferma.
-Quando il cliente identifica l’appuntamento da modificare, chiama select_appointment con l’ID reale: la selezione resta nello stato. Risolvi i riferimenti temporali usando un’ancora esplicita: per una richiesta relativa alla data dell’appuntamento selezionato, usa search_slots(period="selected_appointment_day", day_offset=numero_di_giorni) con i filtri desiderati; per una modifica della fascia sull’ultima ricerca usa same_last_search; per la settimana successiva a quella cercata usa following_last_search_week. Le date relative a oggi usano this_week o next_week. Python calcola tutte le date. Quando il cliente cambia solo il periodo, mantieni le preferenze di fascia non revocate. Non espandere un giorno singolo in una settimana.
-Se esiste un appuntamento selezionato e il cliente indica una nuova fascia oraria senza nominare un altro giorno, il riferimento implicito è il giorno di quell’appuntamento: usa search_slots(period="selected_appointment_day", day_offset=0). Non chiedere nuovamente data o fascia già conosciute.
+Quando il cliente identifica l’appuntamento da modificare, chiama select_appointment con l’ID reale: la selezione resta nello stato. Risolvi i riferimenti temporali usando un’ancora esplicita: per una richiesta relativa alla data dell’appuntamento selezionato, usa search_slots(period="selected_appointment_day", day_offset=numero_di_giorni) SENZA reference, con i filtri desiderati; per una modifica della fascia sull’ultima ricerca usa same_last_search; per la settimana successiva a quella cercata usa following_last_search_week. Le date relative a oggi usano this_week o next_week. Python calcola tutte le date. Quando il cliente cambia solo il periodo, mantieni le preferenze di fascia non revocate. Non espandere un giorno singolo in una settimana.
+Se esiste un appuntamento selezionato e il cliente indica una nuova fascia oraria senza nominare un altro giorno, il riferimento implicito è il giorno di quell’appuntamento: usa search_slots(period="selected_appointment_day", day_offset=0) SENZA reference. Non chiedere nuovamente data o fascia già conosciute.
 Le fasce dello studio sono: mattina prima delle {AFTERNOON_START}; pomeriggio dalle {AFTERNOON_START} fino a prima delle {EVENING_START}; sera dalle {EVENING_START} in poi. Se il cliente chiede solo una fascia, imposta after_time e before_time coerenti con questi confini: mattina before_time='{AFTERNOON_START}', pomeriggio after_time='{AFTERNOON_START}' e before_time='{EVENING_START}', sera after_time='{EVENING_START}'. I confini di after_time sono inclusivi e quelli di before_time esclusivi. Quando il cliente cambia soltanto fascia, usa selected_appointment_day se è stato selezionato un appuntamento; usa same_last_search SOLO per una ricerca generica senza appuntamento selezionato. Non proporre le 12:30 come pomeriggio.
 Non dichiarare mai 'non ci sono disponibilità' sulla base di un errore di tool; distingui errori da assenza di risultati. Quando comunichi una ricerca effettuata, nomina SEMPRE la fascia oraria effettivamente applicata dal backend, anche se non ci sono disponibilità. La fascia della ricerca successiva resta quella precedente se il cliente cambia soltanto settimana; non ometterla nelle risposte.
 Quando il cliente vuole SPOSTARE o CANCELLARE un appuntamento, il PRIMO passo è identificare un appuntamento reale e futuro del cliente. Nelle informazioni di contesto trovi customer_appointments: è una lettura recente del database, non una deduzione. Se ne esiste UNO solo, indica la data e l'ora di quello e verifica che il cliente intenda proprio quell'appuntamento; se ce ne sono più di uno, presentali brevemente e chiedi QUALE vuole modificare. Solo DOPO che l'appuntamento è identificato chiedi quando vorrebbe spostarlo. Se non ci sono appuntamenti nell'elenco e has_more=false, comunica che non risultano appuntamenti futuri confermati da spostare, senza chiedere una nuova data. Se l'elenco è parziale (has_more=true) o il cliente nomina un appuntamento non mostrato, usa list_appointments con filtri o paginazione. Se customer_appointments.status è lookup_error, non affermare che il cliente non abbia appuntamenti: spiega che al momento non riesci a verificarli. Non cercare slot alternativi finché non hai identificato la prenotazione da spostare.
