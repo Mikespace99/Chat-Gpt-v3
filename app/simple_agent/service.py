@@ -37,6 +37,9 @@ class SearchArgs(BaseModel):
     date_to: Date | None = None
     period: str | None = None
     day_offset: int = Field(default=0, ge=-30, le=30)
+    reference: str | None = None  # today, last_search, selected_appointment, explicit
+    week_offset: int = Field(default=0, ge=-12, le=12)
+    keep_time_preferences: bool = True
     week_part: str | None = None
     after_time: str | None = None
     before_time: str | None = None
@@ -47,13 +50,25 @@ class SearchArgs(BaseModel):
     def check(self):
         if self.period not in (None, "this_week", "next_week", "following_last_search_week", "same_last_search", "selected_appointment_day"):
             raise ValueError("Periodo non valido")
+        if self.reference not in (None, "today", "last_search", "selected_appointment", "explicit"):
+            raise ValueError("Riferimento temporale non valido")
+        if self.reference is not None:
+            if self.period is not None or self.day_offset:
+                raise ValueError("Usare reference oppure period, non entrambi")
+            if self.reference == "explicit":
+                if self.week_offset or not self.date_from or not self.date_to:
+                    raise ValueError("Con explicit servono date_from e date_to senza spostamento")
+            elif self.date_from or self.date_to:
+                raise ValueError("Le date esplicite richiedono reference=explicit")
+        elif self.week_offset:
+            raise ValueError("week_offset richiede reference")
         if self.week_part not in (None, "start", "middle", "end"):
             raise ValueError("Porzione della settimana non valida")
         if self.day_offset and self.period != "selected_appointment_day":
             raise ValueError("day_offset richiede il riferimento a un appuntamento selezionato")
         if self.period and (self.date_from or self.date_to):
             raise ValueError("Specificare periodo O date esplicite, non entrambi")
-        if not self.period and (not self.date_from or not self.date_to):
+        if not self.period and not self.reference and (not self.date_from or not self.date_to):
             raise ValueError("Specificare un periodo o entrambe le date")
         if self.date_from and self.date_to and (self.date_to < self.date_from or (self.date_to - self.date_from).days > 30):
             raise ValueError("Intervallo date non valido (massimo 31 giorni)")
@@ -117,12 +132,18 @@ TOOLS = [
     {"type":"function", "function":{"name":"business_info",
       "description":"Leggi servizi, durata, orari e informazioni pubbliche dello studio.",
       "parameters":{"type":"object","properties":{},"additionalProperties":False}}},
+    {"type":"function", "function":{"name":"time_reference_options",
+      "description":"Mostra senza cercare e senza modificare la memoria le settimane candidate attorno all'appuntamento selezionato e all'ultima ricerca. Se il cliente usa un riferimento ambiguo, consulta queste alternative e poni una domanda di chiarimento prima della ricerca.",
+      "parameters":{"type":"object","properties":{},"additionalProperties":False}}},
     {"type":"function", "function":{"name":"search_slots",
       "description":"Cerca orari REALI, dopo che il cliente ha indicato almeno una preferenza temporale. Per 'altri orari' escludi i già proposti.",
       "parameters":{"type":"object","properties":{
         "date_from":{"type":"string","description":"YYYY-MM-DD; usare SOLO per date esplicite"},"date_to":{"type":"string","description":"YYYY-MM-DD; usare SOLO per date esplicite"},
         "period":{"type":"string","enum":["this_week","next_week","following_last_search_week","same_last_search","selected_appointment_day"],"description":"Riferimento temporale: selected_appointment_day usa la data dell’appuntamento selezionato e verificato da Python; same_last_search ripete l’intervallo cercato; following_last_search_week avanza di una settimana rispetto all’ultimo intervallo; this_week e next_week sono riferiti a oggi. Non inventare date."},
-        "day_offset":{"type":"integer","minimum":-30,"maximum":30,"description":"Solo con selected_appointment_day: giorni di distanza dalla data dell’appuntamento selezionato (0 stesso giorno, 1 giorno dopo, -1 giorno prima)."},
+        "day_offset":{"type":"integer","minimum":-30,"maximum":30,"description":"Solo con selected_appointment_day: distanza dalla data dell'appuntamento."},
+        "reference":{"type":"string","enum":["today","last_search","selected_appointment","explicit"],"description":"Ancora esplicita: today=oggi; last_search=ultima ricerca effettiva; selected_appointment=appuntamento verificato da Python; explicit=date_from/date_to esplicite. Se non è chiara, chiedi chiarimento."},
+        "week_offset":{"type":"integer","minimum":-12,"maximum":12,"description":"Settimane relative all'ancora: 0=stessa settimana, 1=la successiva, -1=precedente. Vale solo con reference."},
+        "keep_time_preferences":{"type":"boolean","description":"Di default conserva la fascia precedente quando cambia solo il periodo. false se il cliente la revoca."},
         "week_part":{"type":"string","enum":["start","middle","end"],"description":"Per 'verso fine settimana' usa end"},
         "after_time":{"type":"string"},"before_time":{"type":"string"},"service":{"type":"string"},
         "exclude_previous":{"type":"boolean"}},"required":[],"additionalProperties":False}}},
@@ -139,6 +160,8 @@ SYSTEM = f"""Sei l'unico assistente WhatsApp per prenotare, spostare e cancellar
 Conversa in italiano in modo breve e chiaro. Comprendi liberamente varianti linguistiche e
 preferenze, senza inventare dati o orari. Oggi e il fuso sono nel contesto.
 Se c'è UN SOLO servizio disponibile, è quello predefinito: NON chiedere al cliente quale servizio vuole. 'Appuntamento' è una richiesta generica e non il nome di un servizio.
+I riferimenti temporali sono tre fatti DISTINTI: data dell'appuntamento selezionato, ultima finestra effettivamente cercata e preferenze attive. Per search_slots preferisci reference + week_offset (es. last_search, 1); per "la settimana del 7 dicembre" usa reference="explicit" e date_from/date_to esatte: una correzione esplicita del cliente ha priorità sulle ancore precedenti. NON continuare a incrementare la settimana quando viene fornita una data esplicita.
+Se una frase ammette più ancore ragionevoli (ad esempio "settimana successiva" dopo aver discusso sia della data originale sia di più settimane cercate), NON chiamare search_slots né propose_operation: usa time_reference_options e chiedi QUALE settimana intende, mostrando lunedì e domenica con i giorni della settimana. Una domanda breve basta. Non inventare mai un'ancora. "Primo disponibile" conserva la fascia già espressa finché il cliente non chiede di cambiarla; cerca e proponi uno slot, ma non spostare senza conferma.
 Quando il cliente identifica l’appuntamento da modificare, chiama select_appointment con l’ID reale: la selezione resta nello stato. Risolvi i riferimenti temporali usando un’ancora esplicita: per una richiesta relativa alla data dell’appuntamento selezionato, usa search_slots(period="selected_appointment_day", day_offset=numero_di_giorni) con i filtri desiderati; per una modifica della fascia sull’ultima ricerca usa same_last_search; per la settimana successiva a quella cercata usa following_last_search_week. Le date relative a oggi usano this_week o next_week. Python calcola tutte le date. Quando il cliente cambia solo il periodo, mantieni le preferenze di fascia non revocate. Non espandere un giorno singolo in una settimana.
 Le fasce dello studio sono: mattina prima delle {AFTERNOON_START}; pomeriggio dalle {AFTERNOON_START} fino a prima delle {EVENING_START}; sera dalle {EVENING_START} in poi. Se il cliente chiede solo una fascia, imposta after_time e before_time coerenti con questi confini: mattina before_time='{AFTERNOON_START}', pomeriggio after_time='{AFTERNOON_START}' e before_time='{EVENING_START}', sera after_time='{EVENING_START}'. I confini di after_time sono inclusivi e quelli di before_time esclusivi. Quando il cliente cambia soltanto fascia, usa same_last_search. Non proporre le 12:30 come pomeriggio.
 Non dichiarare mai 'non ci sono disponibilità' sulla base di un errore di tool; distingui errori da assenza di risultati. Quando comunichi una ricerca effettuata, nomina SEMPRE la fascia oraria effettivamente applicata dal backend, anche se non ci sono disponibilità. La fascia della ricerca successiva resta quella precedente se il cliente cambia soltanto settimana; non ometterla nelle risposte.
@@ -295,11 +318,52 @@ def _search_fascia(after_time, before_time):
     return "senza vincoli di fascia oraria"
 
 
+_WEEKDAYS = ("lunedì", "martedì", "mercoledì", "giovedì", "venerdì", "sabato", "domenica")
+_MONTHS = ("gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno", "luglio", "agosto", "settembre", "ottobre", "novembre", "dicembre")
+
+
+def _human_date(value):
+    d = Date.fromisoformat(str(value))
+    return f"{_WEEKDAYS[d.weekday()]} {d.day} {_MONTHS[d.month-1]} {d.year}"
+
+
+def _week_bounds(value):
+    d = Date.fromisoformat(str(value))
+    first = d - timedelta(days=d.weekday())
+    return first, first + timedelta(days=6)
+
+
+def _time_reference_options(state, tenant, customer):
+    """Alternative derivanti da fonti verificate: non modifica l'ultima ricerca."""
+    options = []
+    chosen = state.get("selected_appointment") or {}
+    if chosen.get("id"):
+        own = _owned_appointment(tenant, customer, chosen["id"])
+        if own:
+            monday, sunday = _week_bounds(own["appointment_date"])
+            options.append({"reference":"selected_appointment", "week_offset":1,
+                            "date_from":(monday+timedelta(days=7)).isoformat(),
+                            "date_to":(sunday+timedelta(days=7)).isoformat()})
+    last = state.get("last_search_window")
+    if _valid_search_window(last):
+        monday, sunday = _week_bounds(last["date_to"])
+        options.append({"reference":"last_search", "week_offset":1,
+                        "date_from":(monday+timedelta(days=7)).isoformat(),
+                        "date_to":(sunday+timedelta(days=7)).isoformat()})
+    unique = []
+    for opt in options:
+        if not any(x["date_from"]==opt["date_from"] for x in unique):
+            opt["label"] = f"da {_human_date(opt['date_from'])} a {_human_date(opt['date_to'])}"
+            unique.append(opt)
+    return {"status":"clarification_options", "options":unique,
+            "active_time_preferences":{k:last.get(k) for k in ("after_time","before_time") } if _valid_search_window(last) else None}
+
+
 def _search_report(result):
     """Report vincolato all'ultima ricerca: nessuna fascia può essere omessa."""
     fascia = result["fascia"]
-    periodo = (f"del {result['searched_from']}" if result['searched_from'] == result['searched_to']
-               else f"dal {result['searched_from']} al {result['searched_to']}")
+    periodo = (f"di {_human_date(result['searched_from'])}" if result['searched_from'] == result['searched_to']
+               else f"da {_human_date(result['searched_from'])} a {_human_date(result['searched_to'])}")
     if result["status"] == "not_found_in_requested_window":
         return (f"Non ho trovato appuntamenti disponibili {fascia} {periodo}. "
                 "Vuoi provare un altro giorno o cambiare fascia oraria?")
@@ -325,6 +389,35 @@ def _resolved_window(args: SearchArgs, today: Date, last_search_window=None):
     return args.date_from, args.date_to
 
 
+def _reference_window(args, state, tenant, customer, now):
+    """Risoluzione deterministica: l'AI sceglie la fonte, Python calcola le date."""
+    if args.reference is None:
+        return None
+    if args.reference == "explicit":
+        return args.date_from, args.date_to
+    if args.reference == "today":
+        base = now.date()
+    elif args.reference == "last_search":
+        last = _search_anchor(state)
+        if not _valid_search_window(last):
+            raise ValueError("Ultima ricerca assente: chiedere chiarimento")
+        base = Date.fromisoformat(last["date_to"])
+    else:
+        selected = state.get("selected_appointment") or {}
+        if not selected.get("id"):
+            raise ValueError("Nessun appuntamento selezionato: chiedere chiarimento")
+        own = _owned_appointment(tenant, customer, selected["id"])
+        if not own:
+            state["selected_appointment"] = None
+            raise ValueError("Appuntamento selezionato non più verificabile")
+        base = Date.fromisoformat(str(own["appointment_date"]))
+    monday, _ = _week_bounds(base)
+    monday += timedelta(weeks=args.week_offset)
+    offsets = {None:(0,6), "start":(0,2), "middle":(2,4), "end":(3,6)}
+    first, last = offsets[args.week_part]
+    return monday+timedelta(days=first), monday+timedelta(days=last)
+
+
 def _appointments(tenant, customer, *, date=None, time=None, service=None, page=1):
     return appointments.find_upcoming_for_customer(
         tenant["id"], customer["id"], date=date, time=time,
@@ -341,6 +434,9 @@ def _owned_appointment(tenant, customer, appointment_id):
 
 
 def _execute_tool(name, payload, state, tenant, customer, knowledge, now):
+    if name == "time_reference_options":
+        if payload: raise ValueError("Argomenti non ammessi")
+        return _time_reference_options(state, tenant, customer)
     if name == "select_appointment":
         if set(payload) != {"appointment_id"} or not isinstance(payload["appointment_id"], str):
             raise ValueError("Occorre l'ID dell'appuntamento selezionato")
@@ -366,15 +462,16 @@ def _execute_tool(name, payload, state, tenant, customer, knowledge, now):
                 "working_hours": (knowledge.get("working_hours") or [])[:30]}
     if name == "search_slots":
         args = SearchArgs.model_validate(payload)
-        if args.period in ("following_last_search_week", "same_last_search"):
+        if args.keep_time_preferences and (args.reference is not None or args.period in ("following_last_search_week", "same_last_search")):
             prior = _search_anchor(state) or {}
             inherited = {}
             if args.week_part is None and prior.get("week_part") in ("start", "middle", "end"):
                 inherited["week_part"] = prior["week_part"]
-            if args.after_time is None and prior.get("after_time"):
-                inherited["after_time"] = prior["after_time"]
-            if args.before_time is None and prior.get("before_time"):
-                inherited["before_time"] = prior["before_time"]
+            if args.after_time is None and args.before_time is None:
+                if prior.get("after_time"):
+                    inherited["after_time"] = prior["after_time"]
+                if prior.get("before_time"):
+                    inherited["before_time"] = prior["before_time"]
             if inherited:
                 args = args.model_copy(update=inherited)
         if args.period == "selected_appointment_day":
@@ -393,6 +490,8 @@ def _execute_tool(name, payload, state, tenant, customer, knowledge, now):
             date_from = date_to = target_date + timedelta(days=args.day_offset)
             # Nessun filtro di porzione settimanale per un solo giorno.
             args = args.model_copy(update={"week_part": None})
+        elif args.reference is not None:
+            date_from, date_to = _reference_window(args, state, tenant, customer, now)
         else:
             date_from, date_to = _resolved_window(args, now.date(), state.get("last_search_window"))
         if date_from < now.date() or date_to > now.date() + timedelta(days=90):
@@ -440,6 +539,8 @@ def _execute_tool(name, payload, state, tenant, customer, knowledge, now):
         state["seen_slots"] = state["seen_slots"][-120:]
         return {"slots":slots, "count":len(slots),
                 "searched_from":date_from.isoformat(),"searched_to":date_to.isoformat(),
+                "period_label":(f"da {_human_date(date_from)} a {_human_date(date_to)}" if date_from != date_to else _human_date(date_from)),
+                "display_slots":[f"{_human_date(item['date'])} alle {item['time']}" for item in slots],
                 "service":service,
                 "applied_filters": {"after_time":args.after_time, "before_time":args.before_time,
                                     "week_part":args.week_part},
@@ -705,6 +806,7 @@ def respond(state, message, button_id, tenant, customer, knowledge, client=None)
     text = "Mi dica quale giorno o fascia oraria preferisce, così posso verificare le disponibilità."
     used = 0
     latest_search = None
+    clarification = None
     for _ in range(MAX_CALLS + 1):
         answer = client.chat.completions.create(model=Config.AI_MODEL_INTENT,
                  messages=history, tools=TOOLS, tool_choice="auto", temperature=0)
@@ -723,17 +825,29 @@ def respond(state, message, button_id, tenant, customer, knowledge, client=None)
                     data = json.loads(call.function.arguments or "{}")
                     if not isinstance(data,dict): raise ValueError("Parametri invalidi")
                     output = _execute_tool(call.function.name, data, state, tenant,customer,knowledge,now)
+                    if call.function.name == "time_reference_options" and output.get("status") == "clarification_options":
+                        clarification = output
                     if call.function.name == "search_slots" and output.get("status") in ("ok", "not_found_in_requested_window"):
                         latest_search = output
                 except (ValueError, ValidationError,TypeError,KeyError) as exc:
                     output = {"error":str(exc)[:200]}
             history.append({"role":"tool","tool_call_id":call.id,
                             "content":json.dumps(output,ensure_ascii=False,default=str)})
-            if state.get("pending"):
+            if state.get("pending") or clarification is not None:
                 break
-        if state.get("pending") or used >= MAX_CALLS:
+        if state.get("pending") or clarification is not None or used >= MAX_CALLS:
             break
-    if state.get("pending"):
+    if clarification is not None:
+        options = clarification["options"]
+        if len(options) >= 2:
+            choices = " oppure ".join(opt["label"] for opt in options[:2])
+            text = f"Per essere preciso, intendi la settimana {choices}?"
+        elif options:
+            text = f"Intendi la settimana {options[0]['label']}?"
+        else:
+            text = "A quale settimana ti riferisci? Indicami un giorno o una data di riferimento."
+        buttons = None
+    elif state.get("pending"):
         p = state["pending"]
         text = _present(p)
         buttons = _pending_buttons(p)
