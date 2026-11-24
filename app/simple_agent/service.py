@@ -21,28 +21,65 @@ client = OpenAI(api_key=Config.OPENAI_API_KEY)
 
 
 # ==============================================================================
-# 1. STATO CONVERSAZIONE MINIMALE (Compatibile con webhook.py e worker.py)
+# 1. STATO CONVERSAZIONE MINIMALE
 # ==============================================================================
 def new_state(existing_context: dict | None = None) -> dict:
     if not existing_context or not isinstance(existing_context, dict):
-        return {"messages": []}
-    return {"messages": existing_context.get("messages", [])[-12:]}
+        return {"messages": list()}
+    return {"messages": existing_context.get("messages", list())[-20:]}
 
 
 # ==============================================================================
-# 2. CALENDARIO DINAMICO E CALCOLO SLOT LIBERI IN PYTHON
+# 2. CALENDARIO A 30 GIORNI + ORARI SETTIMANALI NEL PROMPT
 # ==============================================================================
-def _build_14_days_calendar(tz_name: str) -> str:
+def _build_30_days_calendar(tz_name: str) -> str:
     tz = ZoneInfo(tz_name or "Europe/Rome")
     now = datetime.now(tz)
     giorni = ["Lunedì", "Martedì", "Mercoledì", "Giovedì", "Venerdì", "Sabato", "Domenica"]
-    lines = [
-        f"OGGI È: {giorni[now.weekday()]} {now.strftime('%Y-%m-%d')} alle ore {now.strftime('%H:%M')}",
-        "CALENDARIO PROSSIMI 14 GIORNI (usa esclusivamente queste date YYYY-MM-DD):",
-    ]
-    for i in range(14):
+    lines = list()
+    lines.append(f"OGGI È: {giorni[now.weekday()]} {now.strftime('%Y-%m-%d')} alle ore {now.strftime('%H:%M')}")
+    lines.append("CALENDARIO PROSSIMI 30 GIORNI (usa esclusivamente queste date YYYY-MM-DD):")
+    for i in range(30):
         d = now + timedelta(days=i)
         lines.append(f"- {giorni[d.weekday()]}: {d.strftime('%Y-%m-%d')}")
+    return "\n".join(lines)
+
+
+def _build_working_hours_summary(tenant_id: str) -> str:
+    sb = get_supabase()
+    giorni = {
+        1: "Lunedì",
+        2: "Martedì",
+        3: "Mercoledì",
+        4: "Giovedì",
+        5: "Venerdì",
+        6: "Sabato",
+        7: "Domenica",
+    }
+    wh = (
+        sb.table("working_hours")
+        .select("day_of_week, start_time, end_time")
+        .eq("tenant_id", tenant_id)
+        .eq("active", True)
+        .order("day_of_week")
+        .order("start_time")
+        .execute()
+        .data or list()
+    )
+    if not wh:
+        return "Nessun orario di apertura configurato."
+    by_day: dict[int, list[str]] = dict()
+    for row in wh:
+        dow = int(row["day_of_week"])
+        st = str(row["start_time"])[:5]
+        en = str(row["end_time"])[:5]
+        by_day.setdefault(dow, list()).append(f"{st}-{en}")
+    lines = list()
+    for dow in range(1, 8):
+        if dow in by_day:
+            lines.append(f"- {giorni[dow]}: {', '.join(by_day[dow])}")
+        else:
+            lines.append(f"- {giorni[dow]}: CHIUSO")
     return "\n".join(lines)
 
 
@@ -55,7 +92,7 @@ def _compute_free_slots_single_day(
 ) -> list[str]:
     sb = get_supabase()
     d_obj = date.fromisoformat(target_date)
-    dow = d_obj.isoweekday()  # 1 = Lunedì ... 7 = Domenica
+    dow = d_obj.isoweekday()
 
     # 1. Festività nazionali
     hol = (
@@ -64,10 +101,10 @@ def _compute_free_slots_single_day(
         .eq("date", target_date)
         .limit(1)
         .execute()
-        .data or []
+        .data or list()
     )
     if hol:
-        return []
+        return list()
 
     # 2. Chiusure straordinarie del tenant
     exc = (
@@ -77,10 +114,10 @@ def _compute_free_slots_single_day(
         .eq("date", target_date)
         .eq("active", True)
         .execute()
-        .data or []
+        .data or list()
     )
     if any(e["type"] == "closed" for e in exc):
-        return []
+        return list()
 
     # 3. Orari di apertura del giorno
     wh = (
@@ -90,14 +127,14 @@ def _compute_free_slots_single_day(
         .eq("day_of_week", dow)
         .eq("active", True)
         .execute()
-        .data or []
+        .data or list()
     )
     if not wh:
-        return []
+        return list()
 
-    # 4. Intervalli già occupati (appuntamenti confermati + pause straordinarie)
+    # 4. Intervalli già occupati
     busy_rows = list_busy_for_availability(tenant_id, target_date, target_date)
-    busy_intervals: list[tuple[datetime, datetime]] = []
+    busy_intervals: list[tuple[datetime, datetime]] = list()
     for b in busy_rows:
         st = datetime.combine(d_obj, time.fromisoformat(str(b["appointment_time"])[:8]))
         en = st + timedelta(minutes=b.get("duration_minutes") or 30)
@@ -109,7 +146,7 @@ def _compute_free_slots_single_day(
             en = datetime.combine(d_obj, time.fromisoformat(str(e["end_time"])[:8]))
             busy_intervals.append((st, en))
 
-    # 5. Calcolo slot liberi ogni 30 minuti rispettando il preavviso minimo
+    # 5. Calcolo slot liberi ogni 30 minuti
     tz = ZoneInfo(tz_name or "Europe/Rome")
     earliest_allowed = (datetime.now(tz) + timedelta(hours=min_lead_hours)).replace(tzinfo=None)
     free_slots: set[str] = set()
@@ -137,8 +174,8 @@ def _compute_free_slots_range(
     min_lead_hours: int = 2,
 ) -> dict[str, list[str]]:
     start_d = date.fromisoformat(date_from)
-    end_d = min(date.fromisoformat(date_to), start_d + timedelta(days=6))  # Max 7 giorni per chiamata
-    result: dict[str, list[str]] = {}
+    end_d = min(date.fromisoformat(date_to), start_d + timedelta(days=6))
+    result: dict[str, list[str]] = dict()
     curr_d = start_d
     while curr_d <= end_d:
         iso_d = curr_d.isoformat()
@@ -158,14 +195,14 @@ TOOLS = [
         "function": {
             "name": "get_my_appointments",
             "description": "Recupera gli appuntamenti futuri confermati di questo cliente.",
-            "parameters": {"type": "object", "properties": {}, "required": []},
+            "parameters": {"type": "object", "properties": dict(), "required": list()},
         },
     },
     {
         "type": "function",
         "function": {
             "name": "check_free_slots",
-            "description": "Restituisce gli orari liberi reali per un giorno singolo (date_from == date_to) o per un intervallo fino a 7 giorni (es. tutta la settimana prossima).",
+            "description": "Restituisce gli orari liberi reali per un giorno singolo (date_from == date_to) o per un intervallo fino a 7 giorni.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -252,7 +289,7 @@ def respond(
         .eq("active", True)
         .order("sort_order")
         .execute()
-        .data or []
+        .data or list()
     )
     services_by_name = {s["name"].strip().lower(): s for s in services}
     default_duration = services[0]["duration_minutes"] if services else 30
@@ -271,7 +308,10 @@ def respond(
     system_prompt = f"""Sei {tenant.get('assistant_name', 'Assistente')}, l'assistente virtuale di {tenant.get('business_name')}.
 Rispondi su WhatsApp in italiano, in modo breve, naturale e cortese (usa il tu, messaggi concisi).
 
-{_build_14_days_calendar(tz_name)}
+{_build_30_days_calendar(tz_name)}
+
+ORARI SETTIMANALI DELLO STUDIO:
+{_build_working_hours_summary(tenant_id)}
 
 {customer_info}
 
@@ -282,20 +322,21 @@ INFO STUDIO:
 {json.dumps(knowledge, ensure_ascii=False)}
 
 REGOLE OPERATIVE OBBLIGATORIE:
-1. Per spostare o cancellare un appuntamento, chiama SEMPRE prima `get_my_appointments`. Se il cliente ha più appuntamenti, chiedi quale vuole modificare.
-2. Verifica sempre la disponibilità con `check_free_slots` prima di proporre orari (puoi cercare anche su più giorni contemporaneamente, es. tutta la settimana prossima). Non inventare mai orari non presenti nei risultati del tool.
-3. Se il cliente esprime preferenze (es. "di pomeriggio", "settimana prossima", "verso fine settimana"), filtra e proponi gli slot liberi coerenti con la sua richiesta.
-4. Prima di chiamare `book_appointment`, assicurati di avere: servizio, giorno, orario e nome della persona (`person_name`).
-5. Prima di chiamare `book_appointment`, `reschedule_appointment` o `cancel_appointment`, fai un breve riepilogo e chiedi conferma esplicita al cliente (es. "Confermi?").
+1. Rispetta sempre gli ORARI SETTIMANALI DELLO STUDIO: se il cliente chiede una fascia oraria in cui lo studio è chiuso (es. pomeriggio quando lo studio è aperto solo la mattina), diglielo chiaramente subito.
+2. Per spostare o cancellare un appuntamento, chiama SEMPRE prima `get_my_appointments`. Se il cliente ha più appuntamenti, chiedi quale vuole modificare.
+3. Verifica sempre la disponibilità con `check_free_slots` prima di proporre orari. Non inventare mai orari non presenti nei risultati del tool.
+4. Mantieni sempre il contesto della data di cui state parlando: se hai appena proposto una data (es. 8 dicembre alle 09:00) e il cliente dice "facciamo alle 9:30", controlla con `check_free_slots` le 09:30 DI QUELLA STESSA DATA, non cambiare giorno senza motivo.
+5. Prima di chiamare `book_appointment`, assicurati di avere: servizio, giorno, orario e nome della persona (`person_name`).
+6. Prima di chiamare `book_appointment`, `reschedule_appointment` o `cancel_appointment`, fai un breve riepilogo e chiedi conferma esplicita al cliente (es. "Confermi?").
 """
 
-    history = list(state.get("messages", []))
+    history = list(state.get("messages", list()))
     history.append({"role": "user", "content": user_input})
     messages = [{"role": "system", "content": system_prompt}] + history
 
     for _ in range(5):
         response = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4o",
             messages=messages,
             tools=TOOLS,
             temperature=0.1,
@@ -305,7 +346,7 @@ REGOLE OPERATIVE OBBLIGATORIE:
         if not msg.tool_calls:
             reply_text = msg.content or "Come posso aiutarti?"
             history.append({"role": "assistant", "content": reply_text})
-            return {"messages": history[-12:]}, reply_text, None
+            return {"messages": history[-20:]}, reply_text, None
 
         messages.append(msg.model_dump(exclude_none=True))
 
@@ -390,4 +431,4 @@ REGOLE OPERATIVE OBBLIGATORIE:
 
     fallback = "Scusa, ho avuto un piccolo problema tecnico. Puoi ripetere?"
     history.append({"role": "assistant", "content": fallback})
-    return {"messages": history[-12:]}, fallback, None
+    return {"messages": history[-20:]}, fallback, None
