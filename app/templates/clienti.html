@@ -20,8 +20,8 @@
     <div class="mb-4">
       <div class="relative max-w-sm">
         <svg class="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M21 21l-4.35-4.35M17 10a7 7 0 11-14 0 7 7 0 0114 0z"/></svg>
-        <input type="text" x-model="query" @input.debounce.350ms="load()"
-               placeholder="Cerca cliente…"
+        <input type="text" x-model="query" @input.debounce.350ms="offset = 0; load()"
+               placeholder="Cerca cliente o intestatario…"
                class="w-full pl-9 pr-3 py-2 rounded-lg border border-gray-300 text-sm">
       </div>
     </div>
@@ -36,6 +36,8 @@
           <tr class="text-left text-gray-400 text-xs uppercase border-b border-gray-100">
             <th class="py-2 pr-3 font-medium">Nome Cliente</th>
             <th class="py-2 pr-3 font-medium">Contatti</th>
+            <th class="py-2 pr-3 font-medium">Persona 1</th>
+            <th class="py-2 pr-3 font-medium">Persona 2</th>
             <th class="py-2 pr-3 font-medium">Ultimo app.</th>
             <th class="py-2 pr-3 font-medium">Prossimo app.</th>
             <th class="py-2 pr-3 font-medium text-right">Azioni</th>
@@ -54,6 +56,8 @@
                 <div x-text="c.phone_number || '—'"></div>
                 <div class="text-xs text-gray-400" x-text="c.email || ''"></div>
               </td>
+              <td class="py-3 pr-3 text-gray-700" x-text="c.person_1 || '—'"></td>
+              <td class="py-3 pr-3 text-gray-700" x-text="c.person_2 || '—'"></td>
               <td class="py-3 pr-3 text-gray-500" x-text="fmtDate(c.last_appointment) || '—'"></td>
               <td class="py-3 pr-3" x-text="fmtDate(c.next_appointment) || '—'"
                   :class="c.next_appointment ? 'text-brand-600 font-medium' : 'text-gray-400'"></td>
@@ -78,6 +82,10 @@
               <div class="text-sm font-medium text-gray-800 truncate" x-text="c.full_name || 'Senza nome'"></div>
               <div class="text-xs text-gray-400" x-text="c.phone_number || '—'"></div>
             </div>
+          </div>
+          <div class="text-xs text-gray-600 mt-1" x-show="c.person_1 || c.person_2">
+            <span>Visite per: </span>
+            <span class="font-medium" x-text="[c.person_1, c.person_2].filter(Boolean).join(', ')"></span>
           </div>
           <div class="text-xs text-gray-500 flex gap-3 mt-2">
             <span>Ultimo: <span x-text="fmtDate(c.last_appointment) || '—'"></span></span>
@@ -119,7 +127,7 @@
 
       <div class="space-y-3 mb-5">
         <div>
-          <label class="block text-xs font-medium text-gray-600 mb-1">Nome e cognome</label>
+          <label class="block text-xs font-medium text-gray-600 mb-1">Nome e cognome (titolare)</label>
           <input type="text" x-model="form.full_name" class="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm">
         </div>
         <div>
@@ -129,6 +137,16 @@
         <div>
           <label class="block text-xs font-medium text-gray-600 mb-1">Email (opzionale)</label>
           <input type="email" x-model="form.email" class="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm">
+        </div>
+        <div class="grid grid-cols-2 gap-2">
+          <div>
+            <label class="block text-xs font-medium text-gray-600 mb-1">Persona 1 (visita)</label>
+            <input type="text" x-model="form.person_1" class="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm">
+          </div>
+          <div>
+            <label class="block text-xs font-medium text-gray-600 mb-1">Persona 2 (visita)</label>
+            <input type="text" x-model="form.person_2" class="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm">
+          </div>
         </div>
       </div>
 
@@ -147,69 +165,115 @@
 
 {% block page_scripts %}
 <script>
-  function clientiApp() {
-    return {
-      items: [], total: 0, query: '', offset: 0, pageSize: 20, loading: false,
-      modalOpen: false, editingId: null, saving: false,
-      form: { full_name: '', phone_number: '', email: '' },
-      toast: '', toastOk: true,
+function clientiApp() {
+  return {
+    items: [],
+    total: 0,
+    offset: 0,
+    pageSize: 20,
+    query: '',
+    loading: true,
+    modalOpen: false,
+    editingId: null,
+    saving: false,
+    toast: '',
+    toastOk: true,
+    form: { full_name: '', phone_number: '', email: '', person_1: '', person_2: '' },
 
-      async init() { await this.load(); },
+    init() {
+      this.load();
+    },
 
-      async load() {
-        this.loading = true;
-        const qs = new URLSearchParams({ q: this.query, limit: this.pageSize, offset: this.offset });
-        const res = await fetch('/api/clients?' + qs).then(r => r.json()).catch(() => ({ items: [], total: 0 }));
-        this.items = res.items || [];
-        this.total = res.total || 0;
+    showToast(msg, ok = true) {
+      this.toast = msg;
+      this.toastOk = ok;
+      setTimeout(() => { this.toast = ''; }, 3000);
+    },
+
+    initials(name) {
+      if (!name) return '?';
+      return name.trim().split(/\s+/).slice(0, 2).map(p => p[0].toUpperCase()).join('');
+    },
+
+    fmtDate(val) {
+      if (!val) return '';
+      const d = new Date(val);
+      if (isNaN(d)) return val;
+      return d.toLocaleDateString('it-IT', { day: '2-digit', month: '2-digit', year: 'numeric' });
+    },
+
+    async load() {
+      this.loading = true;
+      try {
+        const params = new URLSearchParams({
+          q: this.query,
+          limit: this.pageSize,
+          offset: this.offset,
+        });
+        const res = await fetch('/api/clients?' + params.toString());
+        const data = await res.json();
+        this.items = data.items || [];
+        this.total = data.total || 0;
+      } catch (e) {
+        this.showToast('Errore caricamento clienti', false);
+      } finally {
         this.loading = false;
-      },
+      }
+    },
 
-      prevPage() { this.offset = Math.max(0, this.offset - this.pageSize); this.load(); },
-      nextPage() { this.offset += this.pageSize; this.load(); },
+    prevPage() {
+      if (this.offset >= this.pageSize) {
+        this.offset -= this.pageSize;
+        this.load();
+      }
+    },
 
-      openCreateModal() {
-        this.editingId = null;
-        this.form = { full_name: '', phone_number: '', email: '' };
-        this.modalOpen = true;
-      },
-      openEditModal(c) {
-        this.editingId = c.id;
-        this.form = { full_name: c.full_name || '', phone_number: c.phone_number || '', email: c.email || '' };
-        this.modalOpen = true;
-      },
+    nextPage() {
+      if (this.offset + this.pageSize < this.total) {
+        this.offset += this.pageSize;
+        this.load();
+      }
+    },
 
-      async submitForm() {
-        if (!this.form.full_name || !this.form.phone_number) {
-          this.showToast('Nome e telefono sono obbligatori', false); return;
-        }
-        this.saving = true;
-        const url = this.editingId ? '/api/clients/' + this.editingId : '/api/clients';
+    openCreateModal() {
+      this.editingId = null;
+      this.form = { full_name: '', phone_number: '', email: '', person_1: '', person_2: '' };
+      this.modalOpen = true;
+    },
+
+    openEditModal(c) {
+      this.editingId = c.id;
+      this.form = {
+        full_name: c.full_name || '',
+        phone_number: c.phone_number || '',
+        email: c.email || '',
+        person_1: c.person_1 || '',
+        person_2: c.person_2 || '',
+      };
+      this.modalOpen = true;
+    },
+
+    async submitForm() {
+      this.saving = true;
+      try {
+        const url = this.editingId ? `/api/clients/${this.editingId}` : '/api/clients';
         const method = this.editingId ? 'PATCH' : 'POST';
         const res = await fetch(url, {
-          method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(this.form)
+          method,
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(this.form),
         });
-        this.saving = false;
-        if (!res.ok) { this.showToast('Errore nel salvataggio', false); return; }
+        if (!res.ok) throw new Error();
         this.modalOpen = false;
-        this.showToast('Salvato', true);
-        this.load();
-      },
-
-      initials(name) {
-        if (!name) return '?';
-        return name.trim().split(/\s+/).slice(0, 2).map(p => p[0].toUpperCase()).join('');
-      },
-      fmtDate(iso) {
-        if (!iso) return '';
-        const d = new Date(iso + 'T00:00:00');
-        return d.toLocaleDateString('it-IT', { day: '2-digit', month: 'short', year: 'numeric' });
-      },
-      showToast(msg, ok) {
-        this.toast = msg; this.toastOk = ok;
-        setTimeout(() => { this.toast = ''; }, 3000);
-      },
-    };
-  }
+        this.showToast(this.editingId ? 'Cliente aggiornato' : 'Cliente creato');
+        await this.load();
+      } catch (e) {
+        this.showToast('Errore durante il salvataggio', false);
+      } finally {
+        this.saving = false;
+      }
+    },
+  };
+}
 </script>
 {% endblock %}
