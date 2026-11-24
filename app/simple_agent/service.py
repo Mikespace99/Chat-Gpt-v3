@@ -30,7 +30,36 @@ def new_state(existing_context: dict | None = None) -> dict:
 
 
 # ==============================================================================
-# 2. CALENDARIO A 30 GIORNI + ORARI SETTIMANALI NEL PROMPT
+# 2. HELPER AGGIORNAMENTO NOMI SU CUSTOMERS (person_1, person_2)
+# ==============================================================================
+def _sync_customer_persons(customer: dict, new_person_name: str) -> None:
+    clean_name = (new_person_name or "").strip()
+    if not clean_name:
+        return
+    sb = get_supabase()
+    cid = customer["id"]
+    full_name = (customer.get("full_name") or "").strip()
+    p1 = (customer.get("person_1") or "").strip()
+    p2 = (customer.get("person_2") or "").strip()
+
+    updates: dict[str, str] = dict()
+    if not full_name:
+        updates["full_name"] = clean_name
+        full_name = clean_name
+
+    existing_lower = {x.lower() for x in (full_name, p1, p2) if x}
+    if clean_name.lower() not in existing_lower:
+        if not p1:
+            updates["person_1"] = clean_name
+        elif not p2:
+            updates["person_2"] = clean_name
+
+    if updates:
+        sb.table("customers").update(updates).eq("id", cid).execute()
+
+
+# ==============================================================================
+# 3. CALENDARIO A 30 GIORNI + ORARI SETTIMANALI NEL PROMPT
 # ==============================================================================
 def _build_30_days_calendar(tz_name: str) -> str:
     tz = ZoneInfo(tz_name or "Europe/Rome")
@@ -94,7 +123,6 @@ def _compute_free_slots_single_day(
     d_obj = date.fromisoformat(target_date)
     dow = d_obj.isoweekday()
 
-    # 1. Festività nazionali
     hol = (
         sb.table("holidays")
         .select("id")
@@ -106,7 +134,6 @@ def _compute_free_slots_single_day(
     if hol:
         return list()
 
-    # 2. Chiusure straordinarie del tenant
     exc = (
         sb.table("calendar_exceptions")
         .select("type, start_time, end_time")
@@ -119,7 +146,6 @@ def _compute_free_slots_single_day(
     if any(e["type"] == "closed" for e in exc):
         return list()
 
-    # 3. Orari di apertura del giorno
     wh = (
         sb.table("working_hours")
         .select("start_time, end_time")
@@ -132,7 +158,6 @@ def _compute_free_slots_single_day(
     if not wh:
         return list()
 
-    # 4. Intervalli già occupati
     busy_rows = list_busy_for_availability(tenant_id, target_date, target_date)
     busy_intervals: list[tuple[datetime, datetime]] = list()
     for b in busy_rows:
@@ -146,7 +171,6 @@ def _compute_free_slots_single_day(
             en = datetime.combine(d_obj, time.fromisoformat(str(e["end_time"])[:8]))
             busy_intervals.append((st, en))
 
-    # 5. Calcolo slot liberi ogni 30 minuti
     tz = ZoneInfo(tz_name or "Europe/Rome")
     earliest_allowed = (datetime.now(tz) + timedelta(hours=min_lead_hours)).replace(tzinfo=None)
     free_slots: set[str] = set()
@@ -187,14 +211,14 @@ def _compute_free_slots_range(
 
 
 # ==============================================================================
-# 3. TOOL SQL DISPONIBILI PER L'AI
+# 4. TOOL SQL DISPONIBILI PER L'AI
 # ==============================================================================
 TOOLS = [
     {
         "type": "function",
         "function": {
             "name": "get_my_appointments",
-            "description": "Recupera gli appuntamenti futuri confermati di questo cliente.",
+            "description": "Recupera gli appuntamenti futuri confermati di questo cliente e verifica quanti ne ha attivi.",
             "parameters": {"type": "object", "properties": dict(), "required": list()},
         },
     },
@@ -218,7 +242,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "book_appointment",
-            "description": "Salva una nuova prenotazione nel database SOLO dopo conferma esplicita del cliente.",
+            "description": "Salva una nuova prenotazione nel database SOLO dopo conferma esplicita del cliente (massimo 2 appuntamenti futuri per cliente).",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -265,7 +289,7 @@ TOOLS = [
 
 
 # ==============================================================================
-# 4. ENTRY POINT CHIAMATO DA prepare_whatsapp_message
+# 5. ENTRY POINT CHIAMATO DA prepare_whatsapp_message
 # ==============================================================================
 def respond(
     state: dict,
@@ -300,9 +324,9 @@ def respond(
 
     customer_name = (customer.get("full_name") or "").strip()
     customer_info = (
-        f"Nome cliente in anagrafica: {customer_name}"
+        f"Nome titolare numero WhatsApp: {customer_name}"
         if customer_name
-        else "Nome cliente in anagrafica: SCONOSCIUTO (chiedilo prima di confermare una nuova prenotazione)."
+        else "Nome titolare numero WhatsApp: SCONOSCIUTO (chiedi nome e cognome prima di confermare)."
     )
 
     system_prompt = f"""Sei {tenant.get('assistant_name', 'Assistente')}, l'assistente virtuale di {tenant.get('business_name')}.
@@ -322,12 +346,13 @@ INFO STUDIO:
 {json.dumps(knowledge, ensure_ascii=False)}
 
 REGOLE OPERATIVE OBBLIGATORIE:
-1. Rispetta sempre gli ORARI SETTIMANALI DELLO STUDIO: se il cliente chiede una fascia oraria in cui lo studio è chiuso (es. pomeriggio quando lo studio è aperto solo la mattina), diglielo chiaramente subito.
-2. Per spostare o cancellare un appuntamento, chiama SEMPRE prima `get_my_appointments`. Se il cliente ha più appuntamenti, chiedi quale vuole modificare.
-3. Verifica sempre la disponibilità con `check_free_slots` prima di proporre orari. Non inventare mai orari non presenti nei risultati del tool.
-4. Mantieni sempre il contesto della data di cui state parlando: se hai appena proposto una data (es. 8 dicembre alle 09:00) e il cliente dice "facciamo alle 9:30", controlla con `check_free_slots` le 09:30 DI QUELLA STESSA DATA, non cambiare giorno senza motivo.
-5. Prima di chiamare `book_appointment`, assicurati di avere: servizio, giorno, orario e nome della persona (`person_name`).
-6. Prima di chiamare `book_appointment`, `reschedule_appointment` o `cancel_appointment`, fai un breve riepilogo e chiedi conferma esplicita al cliente (es. "Confermi?").
+1. LIMITE MASSIMO 2 PRENOTAZIONI: Un cliente può avere al massimo 2 appuntamenti futuri attivi. Quando il cliente chiede di fissare un NUOVO appuntamento, chiama subito `get_my_appointments`: se ha già 2 appuntamenti futuri, informalo subito che ha già due appuntamenti fissati, che non è possibile aggiungerne un terzo via WhatsApp e consigliali di contattare direttamente lo studio.
+2. Rispetta sempre gli ORARI SETTIMANALI DELLO STUDIO: se il cliente chiede una fascia oraria in cui lo studio è chiuso (es. pomeriggio quando lo studio è aperto solo la mattina), diglielo chiaramente subito.
+3. Per spostare o cancellare un appuntamento, chiama SEMPRE prima `get_my_appointments`. Se il cliente ha più appuntamenti, chiedi quale vuole modificare.
+4. Verifica sempre la disponibilità con `check_free_slots` prima di proporre orari. Non inventare mai orari non presenti nei risultati del tool.
+5. Mantieni sempre il contesto della data di cui state parlando: se hai appena proposto una data (es. 8 dicembre alle 09:00) e il cliente dice "facciamo alle 9:30", controlla con `check_free_slots` le 09:30 DI QUELLA STESSA DATA, non cambiare giorno senza motivo.
+6. Prima di chiamare `book_appointment`, assicurati di avere: servizio, giorno, orario e nome e cognome della persona per cui si prenota (`person_name`).
+7. Prima di chiamare `book_appointment`, `reschedule_appointment` o `cancel_appointment`, fai un breve riepilogo e chiedi conferma esplicita al cliente (es. "Confermi?").
 """
 
     history = list(state.get("messages", list()))
@@ -356,7 +381,14 @@ REGOLE OPERATIVE OBBLIGATORIE:
             try:
                 if fn_name == "get_my_appointments":
                     appts = list_upcoming_for_customer(tenant_id, customer_id, limit=5, tz_name=tz_name)
-                    tool_result = {"appointments": appts}
+                    for a in appts:
+                        if a.get("person_name"):
+                            _sync_customer_persons(customer, a["person_name"])
+                    tool_result = {
+                        "appointments": appts,
+                        "active_future_count": len(appts),
+                        "max_allowed": 2,
+                    }
 
                 elif fn_name == "check_free_slots":
                     srv = services_by_name.get((args.get("service_name") or "").strip().lower())
@@ -372,27 +404,34 @@ REGOLE OPERATIVE OBBLIGATORIE:
                     tool_result = {"available_slots_by_date": slots_map}
 
                 elif fn_name == "book_appointment":
-                    srv_key = (args.get("service_name") or "").strip().lower()
-                    srv = services_by_name.get(srv_key) or (services[0] if services else None)
-                    p_name = (args.get("person_name") or customer_name or "").strip()
+                    # Controllo rigido lato Python: max 2 appuntamenti futuri
+                    existing = list_upcoming_for_customer(tenant_id, customer_id, limit=5, tz_name=tz_name)
+                    if len(existing) >= 2:
+                        tool_result = {
+                            "error": "LIMITE_RAGGIUNTO: Il cliente ha già 2 appuntamenti futuri fissati. Non è possibile fissarne un terzo; consiglia di contattare direttamente lo studio."
+                        }
+                    else:
+                        srv_key = (args.get("service_name") or "").strip().lower()
+                        srv = services_by_name.get(srv_key) or (services[0] if services else None)
+                        p_name = (args.get("person_name") or customer_name or "").strip()
 
-                    if p_name and not customer_name:
-                        sb.table("customers").update({"full_name": p_name}).eq("id", customer_id).execute()
+                        if p_name:
+                            _sync_customer_persons(customer, p_name)
 
-                    res = create_appointment(
-                        tenant_id=tenant_id,
-                        appointment_date=args["date"],
-                        appointment_time=args["time"],
-                        duration_minutes=srv["duration_minutes"] if srv else default_duration,
-                        source="manual",
-                        customer_id=customer_id,
-                        phone_number=customer.get("phone_number"),
-                        service=srv["name"] if srv else args.get("service_name"),
-                        service_id=srv["id"] if srv else None,
-                        person_name=p_name or None,
-                        notes="Prenotato via WhatsApp AI",
-                    )
-                    tool_result = {"status": "confirmed", "appointment": res}
+                        res = create_appointment(
+                            tenant_id=tenant_id,
+                            appointment_date=args["date"],
+                            appointment_time=args["time"],
+                            duration_minutes=srv["duration_minutes"] if srv else default_duration,
+                            source="manual",
+                            customer_id=customer_id,
+                            phone_number=customer.get("phone_number"),
+                            service=srv["name"] if srv else args.get("service_name"),
+                            service_id=srv["id"] if srv else None,
+                            person_name=p_name or None,
+                            notes="Prenotato via WhatsApp AI",
+                        )
+                        tool_result = {"status": "confirmed", "appointment": res}
 
                 elif fn_name == "reschedule_appointment":
                     res = reschedule_owned_appointment(
