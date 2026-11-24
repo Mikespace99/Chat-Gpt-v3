@@ -677,17 +677,29 @@ async def api_agenda_customers_search(request: Request, q: str = ""):
 # ---------------------------------------------------------------------------
 # Modelli – Clienti
 # ---------------------------------------------------------------------------
+ 
+#class CustomerIn(BaseModel):
+#    full_name: str
+#    phone_number: str
+#    email: Optional[str] = None
+#    person_1: Optional[str] = None
+#    person_2: Optional[str] = None
+
 
 class CustomerIn(BaseModel):
     full_name: str
     phone_number: str
     email: Optional[str] = None
-
+    person_1: Optional[str] = None
+    person_2: Optional[str] = None
+    
 
 class CustomerUpdateIn(BaseModel):
     full_name: Optional[str] = None
     phone_number: Optional[str] = None
     email: Optional[str] = None
+    person_1: Optional[str] = None
+    person_2: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -792,7 +804,9 @@ async def api_clients_create(body: CustomerIn, request: Request):
     tenant = get_tenant_by_owner(user["id"])
     if not tenant:
         raise HTTPException(status_code=404, detail="Studio non trovato")
-    return create_customer_manual(tenant["id"], body.full_name, body.phone_number, body.email)
+    return create_customer_manual(
+        tenant["id"], body.full_name, body.phone_number, body.email, body.person_1, body.person_2
+    )
 
 
 @router.get("/api/clients/{customer_id}")
