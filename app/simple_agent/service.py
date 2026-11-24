@@ -25,8 +25,8 @@ client = OpenAI(api_key=Config.OPENAI_API_KEY)
 # ==============================================================================
 def new_state(existing_context: dict | None = None) -> dict:
     if not existing_context or not isinstance(existing_context, dict):
-        return {"messages":}
-    return {"messages": existing_context.get("messages",)[-12:]}
+        return {"messages": []}
+    return {"messages": existing_context.get("messages", [])[-12:]}
 
 
 # ==============================================================================
@@ -64,10 +64,10 @@ def _compute_free_slots_single_day(
         .eq("date", target_date)
         .limit(1)
         .execute()
-        .data or
+        .data or []
     )
     if hol:
-        return
+        return []
 
     # 2. Chiusure straordinarie del tenant
     exc = (
@@ -77,10 +77,10 @@ def _compute_free_slots_single_day(
         .eq("date", target_date)
         .eq("active", True)
         .execute()
-        .data or
+        .data or []
     )
     if any(e["type"] == "closed" for e in exc):
-        return
+        return []
 
     # 3. Orari di apertura del giorno
     wh = (
@@ -90,14 +90,14 @@ def _compute_free_slots_single_day(
         .eq("day_of_week", dow)
         .eq("active", True)
         .execute()
-        .data or
+        .data or []
     )
     if not wh:
-        return
+        return []
 
     # 4. Intervalli già occupati (appuntamenti confermati + pause straordinarie)
     busy_rows = list_busy_for_availability(tenant_id, target_date, target_date)
-    busy_intervals: list[tuple[datetime, datetime]] =
+    busy_intervals: list[tuple[datetime, datetime]] = []
     for b in busy_rows:
         st = datetime.combine(d_obj, time.fromisoformat(str(b["appointment_time"])[:8]))
         en = st + timedelta(minutes=b.get("duration_minutes") or 30)
@@ -158,7 +158,7 @@ TOOLS = [
         "function": {
             "name": "get_my_appointments",
             "description": "Recupera gli appuntamenti futuri confermati di questo cliente.",
-            "parameters": {"type": "object", "properties": {}, "required":},
+            "parameters": {"type": "object", "properties": {}, "required": []},
         },
     },
     {
@@ -252,10 +252,10 @@ def respond(
         .eq("active", True)
         .order("sort_order")
         .execute()
-        .data or
+        .data or []
     )
     services_by_name = {s["name"].strip().lower(): s for s in services}
-    default_duration = services["duration_minutes"] if services else 30
+    default_duration = services[0]["duration_minutes"] if services else 30
 
     services_text = "\n".join(
         [f"- {s['name']} ({s['duration_minutes']} min, {s.get('price') or 0}€)" for s in services]
@@ -289,7 +289,7 @@ REGOLE OPERATIVE OBBLIGATORIE:
 5. Prima di chiamare `book_appointment`, `reschedule_appointment` o `cancel_appointment`, fai un breve riepilogo e chiedi conferma esplicita al cliente (es. "Confermi?").
 """
 
-    history = list(state.get("messages",))
+    history = list(state.get("messages", []))
     history.append({"role": "user", "content": user_input})
     messages = [{"role": "system", "content": system_prompt}] + history
 
@@ -300,7 +300,7 @@ REGOLE OPERATIVE OBBLIGATORIE:
             tools=TOOLS,
             temperature=0.1,
         )
-        msg = response.choices.message
+        msg = response.choices[0].message
 
         if not msg.tool_calls:
             reply_text = msg.content or "Come posso aiutarti?"
@@ -332,7 +332,7 @@ REGOLE OPERATIVE OBBLIGATORIE:
 
                 elif fn_name == "book_appointment":
                     srv_key = (args.get("service_name") or "").strip().lower()
-                    srv = services_by_name.get(srv_key) or (services if services else None)
+                    srv = services_by_name.get(srv_key) or (services[0] if services else None)
                     p_name = (args.get("person_name") or customer_name or "").strip()
 
                     if p_name and not customer_name:
