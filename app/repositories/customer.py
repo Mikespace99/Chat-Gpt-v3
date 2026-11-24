@@ -1,64 +1,33 @@
-"""
-Repository clienti.
-- Normalizza sempre il numero di telefono
-- Gestisce race condition sul primo insert
-"""
-
 import re
 from app.supabase_client import get_supabase
 
 
 def normalize_phone(phone: str | None) -> str:
-    """
-    Salva sempre in formato internazionale IT (solo cifre, con 39):
-      "+39 333 1234567" → "393331234567"
-      "3331234567"      → "393331234567"
-      "03331234567"     → "393331234567"
-      "393331234567"    → "393331234567"
-    """
     if not phone:
         return ""
-
     digits = re.sub(r"\D", "", str(phone))
     if not digits:
         return ""
-
     if digits.startswith("39") and len(digits) >= 11:
         return digits
-
     if digits.startswith("0"):
         digits = digits.lstrip("0")
-
     if len(digits) == 10 and digits.startswith("3"):
         return "39" + digits
-
     return digits
 
 
 def format_phone_display(phone: str | None) -> str:
-    """
-    Per UI (agenda, clienti, ecc.): toglie il 39 e raggruppa le cifre.
-      "393331234567" → "333 123 4567"
-    """
     digits = normalize_phone(phone)
     if not digits:
         return ""
-
     national = digits[2:] if digits.startswith("39") and len(digits) > 2 else digits
-
-    # Cellulare 10 cifre: 3xx xxx xxxx
     if len(national) == 10:
         return f"{national[:3]} {national[3:6]} {national[6:]}"
-
     return national
 
 
 def search_customers(tenant_id: str, query: str, limit: int = 8) -> list[dict]:
-    """
-    Autocomplete per l'Agenda: cerca per nome o numero (contiene, case
-    insensitive). Usato quando lo staff crea un appuntamento a mano e
-    vuole riusare un cliente già esistente invece di crearne uno nuovo.
-    """
     q = (query or "").strip()
     if not q:
         return []
@@ -67,7 +36,7 @@ def search_customers(tenant_id: str, query: str, limit: int = 8) -> list[dict]:
 
     by_name = (
         sb.table("customers")
-        .select("id, full_name, phone_number")
+        .select("id, full_name, phone_number, person_1, person_2")
         .eq("tenant_id", tenant_id)
         .ilike("full_name", f"%{q}%")
         .limit(limit)
@@ -78,7 +47,7 @@ def search_customers(tenant_id: str, query: str, limit: int = 8) -> list[dict]:
     if digits:
         by_phone = (
             sb.table("customers")
-            .select("id, full_name, phone_number")
+            .select("id, full_name, phone_number, person_1, person_2")
             .eq("tenant_id", tenant_id)
             .ilike("phone_number", f"%{digits}%")
             .limit(limit)
@@ -108,24 +77,22 @@ def update_customer_name(tenant_id: str, customer_id: str, full_name: str) -> di
 
 
 def list_customers(tenant_id: str, search: str = "", limit: int = 20, offset: int = 0) -> dict:
-    """
-    Lista clienti per la pagina /clienti, con ultimo e prossimo
-    appuntamento calcolati lato Python (il client Supabase/postgrest non
-    supporta aggregazioni per-riga in una singola query REST).
-    """
     from datetime import date as _date
 
     sb = get_supabase()
     q = (
         sb.table("customers")
-        .select("id, full_name, phone_number, email, created_at", count="exact")
+        .select("id, full_name, phone_number, email, person_1, person_2, created_at", count="exact")
         .eq("tenant_id", tenant_id)
     )
     search = (search or "").strip()
     if search:
         digits = normalize_phone(search)
         phone_pattern = digits or search
-        q = q.or_(f"full_name.ilike.%{search}%,phone_number.ilike.%{phone_pattern}%")
+        q = q.or_(
+            f"full_name.ilike.%{search}%,phone_number.ilike.%{phone_pattern}%,"
+            f"person_1.ilike.%{search}%,person_2.ilike.%{search}%"
+        )
     q = q.order("full_name").range(offset, offset + limit - 1)
 
     res = q.execute()
@@ -158,9 +125,7 @@ def list_customers(tenant_id: str, search: str = "", limit: int = 20, offset: in
         future = [r for r in rows if r["appointment_date"] > today_str]
         c["last_appointment"] = past[-1]["appointment_date"] if past else None
         c["next_appointment"] = future[0]["appointment_date"] if future else None
-
-    for c in customers:
-          c["phone_number"] = format_phone_display(c.get("phone_number"))
+        c["phone_number"] = format_phone_display(c.get("phone_number"))
 
     return {"items": customers, "total": total}
 
@@ -179,16 +144,21 @@ def get_customer(tenant_id: str, customer_id: str) -> dict | None:
 
 
 def create_customer_manual(
-    tenant_id: str, full_name: str, phone_number: str, email: str | None = None
+    tenant_id: str,
+    full_name: str,
+    phone_number: str,
+    email: str | None = None,
+    person_1: str | None = None,
+    person_2: str | None = None,
 ) -> dict:
-    """Creazione esplicita dalla dashboard (a differenza di get_or_create_customer,
-    usata dal bot WhatsApp, qui il nome è sempre fornito dallo staff)."""
     sb = get_supabase()
     payload = {
         "tenant_id": tenant_id,
         "full_name": full_name,
         "phone_number": normalize_phone(phone_number),
         "email": email,
+        "person_1": person_1,
+        "person_2": person_2,
     }
     payload = {k: v for k, v in payload.items() if v not in (None, "")}
     res = sb.table("customers").insert(payload).execute()
@@ -196,7 +166,7 @@ def create_customer_manual(
 
 
 def update_customer(tenant_id: str, customer_id: str, **fields) -> dict | None:
-    allowed = {"full_name", "phone_number", "email"}
+    allowed = {"full_name", "phone_number", "email", "person_1", "person_2"}
     payload = {k: v for k, v in fields.items() if k in allowed and v is not None}
     if "phone_number" in payload:
         payload["phone_number"] = normalize_phone(payload["phone_number"])
@@ -228,19 +198,11 @@ def count_new_customers(tenant_id: str, date_from_iso: str) -> int:
 
 
 def get_or_create_customer(tenant_id: str, phone_number: str) -> dict:
-    """
-    Recupera o crea il cliente.
-    - Normalizza sempre il numero
-    - In caso di race condition sull'insert (unique violation),
-      riprova con una select.
-    """
     phone = normalize_phone(phone_number)
     if not phone:
         raise ValueError("phone_number vuoto dopo normalizzazione")
 
     sb = get_supabase()
-
-    # 1. Cerca esistente
     result = (
         sb.table("customers")
         .select("*")
@@ -252,23 +214,17 @@ def get_or_create_customer(tenant_id: str, phone_number: str) -> dict:
     if result.data:
         return result.data[0]
 
-    # 2. Prova insert
     try:
         insert = (
             sb.table("customers")
-            .insert({
-                "tenant_id": tenant_id,
-                "phone_number": phone,
-            })
+            .insert({"tenant_id": tenant_id, "phone_number": phone})
             .execute()
         )
         if insert.data:
             return insert.data[0]
     except Exception as e:
-        # Probabile unique violation per race condition
         print(f"[customer] Insert fallito (possibile race): {e}")
 
-    # 3. Retry select (l'altro thread ha creato il record)
     result = (
         sb.table("customers")
         .select("*")
